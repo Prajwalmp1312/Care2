@@ -1,0 +1,11 @@
+node_modules/
+.env
+.env.*
+!.env.example
+uploads/
+coverage/
+*.log
+.DS_Store
+yolov8n.pt
+__pycache__/
+*.pyc
