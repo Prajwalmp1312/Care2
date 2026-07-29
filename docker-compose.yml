@@ -1,0 +1,81 @@
+name: careconnect-suite
+
+services:
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+
+  careconnect:
+    build: ./services/careconnect
+    restart: unless-stopped
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USER: root
+      DB_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      DB_NAME: careconnect_pro
+      SECRET_KEY: ${CARECONNECT_SECRET_KEY}
+      ENVIRONMENT: production
+      ALGORITHM: HS256
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-60}
+      JWT_ISSUER: ${JWT_ISSUER:-careconnect-api}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-careconnect-web}
+      REQUIRE_EMAIL_VERIFICATION: ${REQUIRE_EMAIL_VERIFICATION:-false}
+      TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-true}
+      MEDICAL_UPLOAD_MAX_MB: ${MEDICAL_UPLOAD_MAX_MB:-20}
+      CHAT_UPLOAD_MAX_MB: ${CHAT_UPLOAD_MAX_MB:-10}
+      COMM360_BASE_URL: ${COMM360_BASE_URL:-https://comm360.feeltiptop.com/}
+      APPOINTMENT_TIMEZONE: ${APPOINTMENT_TIMEZONE:-America/Los_Angeles}
+      FRONTEND_URL: http://localhost:3000
+      ALLOWED_ORIGINS: http://localhost:3000
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      CHROMA_DB_PATH: /app/chroma_db
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-}
+      SMTP_EMAIL: ${SMTP_EMAIL:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      MAILJET_API_KEY: ${MAILJET_API_KEY:-}
+      MAILJET_SECRET: ${MAILJET_SECRET:-}
+      MAILJET_FROM_EMAIL: ${MAILJET_FROM_EMAIL:-}
+      MAILJET_FROM_NAME: ${MAILJET_FROM_NAME:-CareConnect Pro}
+      DEFAULT_ADMIN_NAME: ${DEFAULT_ADMIN_NAME:-CareConnect Admin}
+      DEFAULT_ADMIN_EMAIL: ${DEFAULT_ADMIN_EMAIL:-}
+      DEFAULT_ADMIN_PASSWORD: ${DEFAULT_ADMIN_PASSWORD:-}
+    volumes:
+      - careconnect_uploads:/app/uploads
+      - careconnect_chroma:/app/chroma_db
+    ports:
+      - "8000:8000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  web:
+    build: ./apps/web
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      careconnect:
+        condition: service_healthy
+
+volumes:
+  mysql_data:
+  careconnect_uploads:
+  careconnect_chroma:
