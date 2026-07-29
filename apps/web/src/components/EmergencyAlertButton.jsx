@@ -1,172 +1,181 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import axios from "axios";
-
-const API_BASE_URL = "http://localhost:8000";
+import CareConsentDialog from "./CareConsentDialog";
 
 const EmergencyAlertButton = ({ onAlertCreated }) => {
-  const [showModal, setShowModal] = useState(false);
-  const [alertType, setAlertType] = useState("medical_emergency");
-  const [severity, setSeverity] = useState("high");
-  const [message, setMessage] = useState("");
   const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState("");
+  const [feedback, setFeedback] = useState(null);
+  const [consentAccepted, setConsentAccepted] = useState(null);
+  const [consent, setConsent] = useState(null);
+  const [consentError, setConsentError] = useState("");
 
-  const triggerAlert = async () => {
-    if (!message.trim()) {
-      setError("Please enter emergency details.");
-      return;
-    }
+  const requestHeaders = () => ({
+    Authorization: `Bearer ${localStorage.getItem("access_token")}`,
+  });
 
+  useEffect(() => {
+    let active = true;
+    axios
+      .get("/api/consents/emergency_alert", {
+        headers: requestHeaders(),
+      })
+      .then((response) => {
+        if (active) setConsentAccepted(Boolean(response.data.accepted));
+      })
+      .catch(() => {
+        if (active) setConsentAccepted(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const postSos = async () => {
+    const response = await axios.post(
+      "/api/emergency-alerts",
+      {
+        alert_type: "medical_emergency",
+        severity: "critical",
+        message:
+          "SOS activated by the patient. Immediate assistance may be required.",
+      },
+      { headers: requestHeaders() },
+    );
+
+    setFeedback({
+      type: "success",
+      message:
+        response.data.notice ||
+        "SOS sent. Your care team and administrators were notified.",
+    });
+    window.dispatchEvent(new Event("careconnect:notifications-updated"));
+    onAlertCreated?.();
+  };
+
+  const triggerSos = async () => {
+    if (submitting) return;
     try {
       setSubmitting(true);
-      setError("");
+      setFeedback(null);
+      setConsentError("");
 
-      const token = localStorage.getItem("access_token");
-
-      await axios.post(
-        `${API_BASE_URL}/api/emergency-alerts`,
-        {
-          alert_type: alertType,
-          severity,
-          message: message.trim(),
-        },
-        {
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
+      if (consentAccepted !== true) {
+        const response = await axios.get(
+          "/api/consents/emergency_alert",
+          { headers: requestHeaders() },
+        );
+        if (!response.data.accepted) {
+          setConsent(response.data);
+          setConsentAccepted(false);
+          return;
         }
-      );
-
-      alert("Emergency alert sent successfully.");
-
-      setShowModal(false);
-      setAlertType("medical_emergency");
-      setSeverity("high");
-      setMessage("");
-
-      if (onAlertCreated) {
-        onAlertCreated();
+        setConsentAccepted(true);
       }
+
+      await postSos();
     } catch (err) {
-      console.error("Emergency alert failed:", err.response?.data || err);
-      setError(err.response?.data?.detail || "Failed to send emergency alert.");
+      console.error("SOS alert failed:", err.response?.data || err);
+      setFeedback({
+        type: "error",
+        message: err.response?.data?.detail || "Unable to send SOS. Try again.",
+      });
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const acceptConsentAndTrigger = async () => {
+    if (submitting) return;
+    try {
+      setSubmitting(true);
+      setConsentError("");
+      await axios.post(
+        "/api/consents/emergency_alert",
+        {
+          accepted: true,
+          consent_version: consent?.version,
+        },
+        { headers: requestHeaders() },
+      );
+      setConsentAccepted(true);
+      setConsent(null);
+      await postSos();
+    } catch (err) {
+      console.error("SOS consent failed:", err.response?.data || err);
+      setConsentError(
+        err.response?.data?.detail ||
+          "Unable to save consent and send SOS. Try again.",
+      );
     } finally {
       setSubmitting(false);
     }
   };
 
   return (
-    <>
+    <div className="relative">
       <button
-        onClick={() => setShowModal(true)}
-        className="bg-red-600 hover:bg-red-700 text-white px-5 py-3 rounded-xl font-bold shadow-lg flex items-center gap-2 transition"
+        type="button"
+        onClick={triggerSos}
+        disabled={submitting}
+        aria-label="Send SOS emergency alert"
+        aria-describedby="sos-help-text"
+        className="flex min-w-24 items-center justify-center gap-2 rounded-full bg-red-600 px-5 py-3 font-black tracking-wide text-white shadow-lg shadow-red-200 transition hover:bg-red-700 focus:outline-none focus:ring-4 focus:ring-red-200 disabled:cursor-wait disabled:opacity-70"
       >
-        <i className="fas fa-triangle-exclamation"></i>
-        Emergency Alert
+        <i
+          className={`fas ${
+            submitting ? "fa-spinner fa-spin" : "fa-circle-exclamation"
+          }`}
+        ></i>
+        {submitting ? "SENDING" : "SOS"}
       </button>
 
-      {showModal && (
-        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl shadow-2xl max-w-lg w-full overflow-hidden">
-            <div className="bg-red-600 text-white p-5 flex items-center justify-between">
-              <div>
-                <h3 className="text-xl font-bold flex items-center gap-2">
-                  <i className="fas fa-triangle-exclamation"></i>
-                  Trigger Emergency Alert
-                </h3>
-                <p className="text-sm opacity-90 mt-1">
-                  This will notify connected clinicians and admins.
-                </p>
-              </div>
+      <span id="sos-help-text" className="sr-only">
+        Sends a critical CareConnect alert without asking for emergency
+        details. This does not automatically dispatch emergency services.
+      </span>
 
-              <button
-                onClick={() => setShowModal(false)}
-                className="text-white hover:text-red-100"
-              >
-                <i className="fas fa-times text-xl"></i>
-              </button>
-            </div>
-
-            <div className="p-6 space-y-5">
-              <div className="bg-red-50 border border-red-200 text-red-700 rounded-lg p-4 text-sm">
-                Use this only for urgent medical situations. If this is a real emergency,
-                call your local emergency number immediately.
-              </div>
-
-              <div>
-                <label className="block text-sm font-semibold text-gray-700 mb-2">
-                  Emergency Type
-                </label>
-                <select
-                  value={alertType}
-                  onChange={(e) => setAlertType(e.target.value)}
-                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-transparent"
-                >
-                  <option value="medical_emergency">Medical Emergency</option>
-                  <option value="severe_pain">Severe Pain</option>
-                  <option value="breathing_issue">Breathing Issue</option>
-                  <option value="accident">Accident</option>
-                  <option value="medication_reaction">Medication Reaction</option>
-                  <option value="other">Other</option>
-                </select>
-              </div>
-
-              <div>
-                <label className="block text-sm font-semibold text-gray-700 mb-2">
-                  Severity
-                </label>
-                <select
-                  value={severity}
-                  onChange={(e) => setSeverity(e.target.value)}
-                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-transparent"
-                >
-                  <option value="medium">Medium</option>
-                  <option value="high">High</option>
-                  <option value="critical">Critical</option>
-                </select>
-              </div>
-
-              <div>
-                <label className="block text-sm font-semibold text-gray-700 mb-2">
-                  Emergency Details
-                </label>
-                <textarea
-                  value={message}
-                  onChange={(e) => setMessage(e.target.value)}
-                  rows={4}
-                  placeholder="Example: I am experiencing severe chest pain and dizziness."
-                  className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-transparent resize-none"
-                />
-              </div>
-
-              {error && (
-                <div className="bg-red-50 border border-red-200 text-red-700 rounded-lg p-3 text-sm">
-                  {error}
-                </div>
-              )}
-
-              <div className="flex justify-end gap-3 pt-2">
-                <button
-                  onClick={() => setShowModal(false)}
-                  disabled={submitting}
-                  className="px-5 py-3 rounded-lg border border-gray-300 text-gray-700 font-semibold hover:bg-gray-50"
-                >
-                  Cancel
-                </button>
-
-                <button
-                  onClick={triggerAlert}
-                  disabled={submitting}
-                  className="px-5 py-3 rounded-lg bg-red-600 hover:bg-red-700 text-white font-bold disabled:opacity-50"
-                >
-                  {submitting ? "Sending..." : "Send Emergency Alert"}
-                </button>
-              </div>
-            </div>
+      {feedback && (
+        <div
+          role={feedback.type === "error" ? "alert" : "status"}
+          className={`absolute right-0 top-full z-[70] mt-3 w-72 rounded-xl border p-3 text-sm font-medium shadow-xl ${
+            feedback.type === "error"
+              ? "border-red-200 bg-red-50 text-red-700"
+              : "border-green-200 bg-green-50 text-green-700"
+          }`}
+        >
+          <div className="flex items-start gap-2">
+            <i
+              className={`fas mt-0.5 ${
+                feedback.type === "error"
+                  ? "fa-triangle-exclamation"
+                  : "fa-circle-check"
+              }`}
+            ></i>
+            <span className="flex-1">{feedback.message}</span>
+            <button
+              type="button"
+              onClick={() => setFeedback(null)}
+              className="opacity-60 hover:opacity-100"
+              aria-label="Dismiss SOS status"
+            >
+              <i className="fas fa-times"></i>
+            </button>
           </div>
         </div>
       )}
-    </>
+
+      <CareConsentDialog
+        consent={consent}
+        busy={submitting}
+        error={consentError}
+        acceptLabel="Accept and send SOS"
+        onCancel={() => {
+          setConsent(null);
+          setConsentError("");
+        }}
+        onAccept={acceptConsentAndTrigger}
+      />
+    </div>
   );
 };
 

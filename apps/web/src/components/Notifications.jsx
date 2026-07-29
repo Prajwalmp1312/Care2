@@ -11,7 +11,8 @@ const Notifications = () => {
     if (type === "appointment") return "fa-calendar-check";
     if (type === "prescription") return "fa-prescription-bottle-medical";
     if (type === "message") return "fa-comments";
-    if (type === "alert") return "fa-triangle-exclamation";
+    if (["alert", "emergency"].includes(type))
+      return "fa-triangle-exclamation";
     if (type === "admin") return "fa-shield-alt";
     return "fa-bell";
   };
@@ -20,7 +21,8 @@ const Notifications = () => {
     if (type === "appointment") return "bg-blue-100 text-blue-600";
     if (type === "prescription") return "bg-purple-100 text-purple-600";
     if (type === "message") return "bg-green-100 text-green-600";
-    if (type === "alert") return "bg-red-100 text-red-600";
+    if (["alert", "emergency"].includes(type))
+      return "bg-red-100 text-red-600";
     if (type === "admin") return "bg-gray-100 text-gray-600";
     return "bg-yellow-100 text-yellow-600";
   };
@@ -54,8 +56,19 @@ const Notifications = () => {
     const interval = setInterval(() => {
       refreshNotifications();
     }, 30000);
+    const handleNotificationUpdate = () => refreshNotifications();
+    window.addEventListener(
+      "careconnect:notifications-updated",
+      handleNotificationUpdate,
+    );
 
-    return () => clearInterval(interval);
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener(
+        "careconnect:notifications-updated",
+        handleNotificationUpdate,
+      );
+    };
   }, []);
 
   useEffect(() => {

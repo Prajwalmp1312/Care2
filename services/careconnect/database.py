@@ -75,6 +75,20 @@ def _add_column_if_missing(conn, table_name: str, column_name: str, ddl: str) ->
         print(f"✅ Migration: added {table_name}.{column_name}")
 
 
+def _add_index_if_missing(conn, table_name: str, index_name: str, columns: str) -> None:
+    row = conn.execute(
+        text(
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.STATISTICS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = :table_name "
+            "AND INDEX_NAME = :index_name"
+        ),
+        {"table_name": table_name, "index_name": index_name},
+    ).fetchone()
+    if not row or row[0] == 0:
+        conn.execute(text(f"CREATE INDEX {index_name} ON {table_name} ({columns})"))
+        print(f"Migration: added index {index_name}")
+
+
 def ensure_existing_schema_columns():
     """Add columns that create_all() will not add to already-created MySQL tables."""
     try:
@@ -117,6 +131,61 @@ def ensure_existing_schema_columns():
             # SQLAlchemy create_all() does not alter an existing table.
             _add_column_if_missing(conn, "appointments", "appointment_type", "appointment_type VARCHAR(50) NOT NULL DEFAULT 'phone_call'")
             _add_column_if_missing(conn, "appointments", "notes", "notes TEXT NULL")
+
+            # Emergency-response operational ownership and escalation fields.
+            for column_name, ddl in (
+                ("escalation_level", "escalation_level INT NOT NULL DEFAULT 1"),
+                ("owner_email", "owner_email VARCHAR(100) NULL"),
+                ("owner_role", "owner_role VARCHAR(20) NULL"),
+                ("ownership_assigned_at", "ownership_assigned_at DATETIME NULL"),
+                ("operational_state", "operational_state VARCHAR(30) NOT NULL DEFAULT 'unassigned'"),
+                ("last_monitored_at", "last_monitored_at DATETIME NULL"),
+                ("next_review_at", "next_review_at DATETIME NULL"),
+                ("escalation_deadline", "escalation_deadline DATETIME NULL"),
+                ("consent_version", "consent_version VARCHAR(30) NULL"),
+                ("consent_acknowledged", "consent_acknowledged TINYINT(1) NOT NULL DEFAULT 0"),
+            ):
+                _add_column_if_missing(conn, "emergency_alerts", column_name, ddl)
+            _add_index_if_missing(conn, "emergency_alerts", "ix_emergency_alerts_owner_email", "owner_email")
+            _add_index_if_missing(conn, "emergency_alerts", "ix_emergency_alerts_next_review_at", "next_review_at")
+            _add_index_if_missing(conn, "emergency_alerts", "ix_emergency_alerts_escalation_deadline", "escalation_deadline")
+            conn.execute(
+                text(
+                    "UPDATE emergency_alerts SET "
+                    "operational_state = CASE "
+                    "WHEN status = 'resolved' THEN 'resolved' "
+                    "WHEN owner_email IS NOT NULL THEN 'owned' "
+                    "ELSE 'unassigned' END, "
+                    "last_monitored_at = COALESCE(last_monitored_at, updated_at, created_at, UTC_TIMESTAMP()), "
+                    "next_review_at = CASE "
+                    "WHEN status IN ('active', 'acknowledged') AND next_review_at IS NULL "
+                    "THEN DATE_ADD(UTC_TIMESTAMP(), INTERVAL 5 MINUTE) "
+                    "WHEN status = 'resolved' THEN NULL ELSE next_review_at END, "
+                    "escalation_deadline = CASE "
+                    "WHEN status IN ('active', 'acknowledged') AND escalation_deadline IS NULL "
+                    "THEN DATE_ADD(UTC_TIMESTAMP(), INTERVAL 10 MINUTE) "
+                    "ELSE escalation_deadline END"
+                )
+            )
+
+            # Controlled clinical-document classification.
+            _add_column_if_missing(conn, "medical_records", "category_code", "category_code VARCHAR(50) NOT NULL DEFAULT 'other'")
+            _add_column_if_missing(conn, "medical_records", "tags", "tags TEXT NULL")
+            _add_column_if_missing(conn, "medical_records", "source_date", "source_date VARCHAR(10) NULL")
+            conn.execute(
+                text(
+                    "UPDATE medical_records SET category_code = CASE "
+                    "WHEN LOWER(category) IN ('lab', 'lab results', 'laboratory', 'laboratory results') THEN 'laboratory' "
+                    "WHEN LOWER(category) = 'imaging' THEN 'imaging' "
+                    "WHEN LOWER(category) IN ('clinical notes', 'visit note') THEN 'visit_note' "
+                    "WHEN LOWER(category) IN ('prescription', 'prescriptions') THEN 'prescription' "
+                    "WHEN LOWER(category) IN ('vitals', 'vital signs') THEN 'vital_signs' "
+                    "WHEN LOWER(category) IN ('discharge', 'discharge summary') THEN 'discharge_summary' "
+                    "ELSE COALESCE(NULLIF(category_code, ''), 'other') END"
+                )
+            )
+            _add_index_if_missing(conn, "medical_records", "ix_medical_records_category_code", "category_code")
+            _add_index_if_missing(conn, "medical_records", "ix_medical_records_source_date", "source_date")
     except Exception as e:
         print(f"⚠️ ensure_existing_schema_columns: {e}")
 

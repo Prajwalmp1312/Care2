@@ -1,5 +1,7 @@
 import React, { useEffect, useState } from "react";
 import axios from "axios";
+import AIReportComparison from "./AIReportComparison";
+import ClinicalExportButton from "./ClinicalExportButton";
 
 const measurementFields = [
   ["weight_kg", "Weight (kg)"], ["height_cm", "Height (cm)"],
@@ -8,7 +10,7 @@ const measurementFields = [
   ["diastolic_bp", "Diastolic BP"],
 ];
 
-const PatientClinicalProfile = ({ patientEmail, patientId, canEdit = false, onClose, onUpdated }) => {
+const PatientClinicalProfile = ({ patientEmail, patientId, canEdit = false, canExport = true, onClose, onUpdated }) => {
   const [data, setData] = useState(null);
   const [draft, setDraft] = useState({});
   const [loading, setLoading] = useState(true);
@@ -44,7 +46,10 @@ const PatientClinicalProfile = ({ patientEmail, patientId, canEdit = false, onCl
     <div className="mx-auto my-4 max-w-6xl rounded-2xl bg-white shadow-2xl">
       <div className="sticky top-0 z-10 flex items-center justify-between rounded-t-2xl bg-gradient-to-r from-blue-700 to-indigo-700 p-5 text-white">
         <div><h2 className="text-2xl font-bold">Patient Clinical Profile</h2><p className="text-sm text-blue-100">Summary, records, prescriptions, and longitudinal measurements</p></div>
-        <button onClick={onClose} className="rounded-full bg-white/15 px-3 py-2 hover:bg-white/25" aria-label="Close">✕</button>
+        <div className="flex items-center gap-2">
+          {canExport && <ClinicalExportButton patientEmail={patientEmail} dark />}
+          <button onClick={onClose} className="rounded-full bg-white/15 px-3 py-2 hover:bg-white/25" aria-label="Close">✕</button>
+        </div>
       </div>
       <div className="p-6">
         {loading && <p className="py-16 text-center text-gray-500">Loading clinical profile…</p>}
@@ -89,6 +94,8 @@ const PatientClinicalProfile = ({ patientEmail, patientId, canEdit = false, onCl
           </section>
 
           <section className="rounded-xl border p-5"><h3 className="mb-3 text-lg font-bold">Measurement History</h3><div className="overflow-x-auto"><table className="w-full text-sm"><thead><tr className="bg-gray-50 text-left"><th className="p-2">Recorded</th><th className="p-2">Weight</th><th className="p-2">BMI</th><th className="p-2">Body fat</th><th className="p-2">Muscle</th><th className="p-2">Waist</th><th className="p-2">Blood pressure</th><th className="p-2">Reason</th></tr></thead><tbody>{data.profile_history.map((item) => <tr key={item.id} className="border-t"><td className="p-2">{new Date(item.recorded_at).toLocaleString()}</td><td className="p-2">{item.weight_kg ?? "—"}</td><td className="p-2">{item.bmi ?? "—"}</td><td className="p-2">{item.body_fat_percentage ?? "—"}</td><td className="p-2">{item.muscle_mass_kg ?? "—"}</td><td className="p-2">{item.waist_cm ?? "—"}</td><td className="p-2">{item.systolic_bp && item.diastolic_bp ? `${item.systolic_bp}/${item.diastolic_bp}` : "—"}</td><td className="p-2">{item.change_reason || "—"}</td></tr>)}</tbody></table>{!data.profile_history.length && <p className="py-6 text-center text-gray-500">No previous measurements yet.</p>}</div></section>
+
+          <AIReportComparison records={data.records} />
 
           <section className="rounded-xl border p-5"><h3 className="mb-3 text-lg font-bold">Medical Records</h3><div className="space-y-3">{data.records.map((record) => <div key={record.id} className="rounded-lg border bg-gray-50 p-4"><div className="flex justify-between gap-3"><b>{record.name}</b><span className="text-xs text-gray-500">{record.uploaded_at ? new Date(record.uploaded_at).toLocaleDateString() : ""}</span></div><p className="text-xs text-gray-500">{record.type} · {record.category}</p><p className="mt-2 text-sm text-gray-700">{record.analysis_summary || "No summary available"}</p></div>)}{!data.records.length && <p className="text-gray-500">No records available.</p>}</div></section>
 

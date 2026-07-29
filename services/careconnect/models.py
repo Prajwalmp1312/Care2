@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, Text, Float
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, Text, Float, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 from datetime import datetime, timezone
 
@@ -147,6 +147,9 @@ class MedicalRecord(Base):
     type = Column(String(50), nullable=False)  # Lab Results, Clinical Notes, etc.
     name = Column(String(200), nullable=False)
     category = Column(String(50), nullable=False)
+    category_code = Column(String(50), nullable=False, default="other", index=True)
+    tags = Column(Text, nullable=True)  # JSON array of user-confirmed tags
+    source_date = Column(String(10), nullable=True, index=True)  # YYYY-MM-DD
     file_path = Column(String(500))
     uploaded_at = Column(DateTime, default=utc_now)
     uploaded_by = Column(String(100))  # clinician email
@@ -309,9 +312,71 @@ class EmergencyAlert(Base):
 
     resolved_by = Column(String(100), nullable=True)
     resolved_at = Column(DateTime, nullable=True)
+    escalation_level = Column(Integer, default=1, nullable=False)
+    owner_email = Column(String(100), nullable=True, index=True)
+    owner_role = Column(String(20), nullable=True)
+    ownership_assigned_at = Column(DateTime, nullable=True)
+    operational_state = Column(String(30), default="unassigned", nullable=False)
+    last_monitored_at = Column(DateTime, nullable=True)
+    next_review_at = Column(DateTime, nullable=True, index=True)
+    escalation_deadline = Column(DateTime, nullable=True, index=True)
+    consent_version = Column(String(30), nullable=True)
+    consent_acknowledged = Column(Boolean, default=False, nullable=False)
 
     created_at = Column(DateTime, default=utc_now)
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
+
+
+class EmergencyAlertEvent(Base):
+    __tablename__ = "emergency_alert_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    alert_id = Column(
+        Integer,
+        ForeignKey("emergency_alerts.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    event_type = Column(String(40), nullable=False, index=True)
+    actor_email = Column(String(100), nullable=True)
+    actor_role = Column(String(20), nullable=True)
+    escalation_level = Column(Integer, nullable=False, default=1)
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=utc_now, nullable=False, index=True)
+
+
+class UserConsent(Base):
+    __tablename__ = "user_consents"
+    __table_args__ = (
+        UniqueConstraint("user_email", "consent_type", name="uq_user_consent_type"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_email = Column(String(100), nullable=False, index=True)
+    user_role = Column(String(20), nullable=False)
+    consent_type = Column(String(40), nullable=False, index=True)
+    consent_version = Column(String(30), nullable=False)
+    status = Column(String(20), nullable=False, default="accepted")
+    accepted_at = Column(DateTime, nullable=False, default=utc_now)
+    revoked_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, nullable=False, default=utc_now, onupdate=utc_now)
+
+
+class VideoConsultationEvent(Base):
+    __tablename__ = "video_consultation_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    appointment_id = Column(
+        Integer,
+        ForeignKey("appointments.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    actor_email = Column(String(100), nullable=False, index=True)
+    actor_role = Column(String(20), nullable=False)
+    event_type = Column(String(40), nullable=False, index=True)
+    provider = Column(String(50), nullable=False, default="comm360")
+    created_at = Column(DateTime, default=utc_now, nullable=False, index=True)
 
 class AdminAuditLog(Base):
     __tablename__ = "admin_audit_logs"
@@ -322,3 +387,40 @@ class AdminAuditLog(Base):
     target_email = Column(String(100))  # Email of affected user
     details = Column(Text)  # JSON string with additional details
     timestamp = Column(DateTime, default=utc_now)
+
+
+class UserSession(Base):
+    """Revocable server-side session backing each access token."""
+
+    __tablename__ = "user_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    jti = Column(String(64), unique=True, nullable=False, index=True)
+    user_email = Column(String(100), nullable=False, index=True)
+    user_role = Column(String(20), nullable=False, index=True)
+    user_agent = Column(String(500), nullable=True)
+    ip_address = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    last_seen_at = Column(DateTime, default=utc_now, nullable=False)
+    revoked_at = Column(DateTime, nullable=True, index=True)
+    revoke_reason = Column(String(255), nullable=True)
+
+
+class SecurityAuditEvent(Base):
+    """General, append-oriented security and clinical access audit stream."""
+
+    __tablename__ = "security_audit_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    request_id = Column(String(64), nullable=True, index=True)
+    actor_email = Column(String(100), nullable=True, index=True)
+    actor_role = Column(String(20), nullable=True, index=True)
+    action = Column(String(120), nullable=False, index=True)
+    resource_type = Column(String(80), nullable=True, index=True)
+    resource_id = Column(String(120), nullable=True)
+    patient_email = Column(String(100), nullable=True, index=True)
+    outcome = Column(String(20), nullable=False, default="success", index=True)
+    ip_address = Column(String(64), nullable=True)
+    details = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=utc_now, nullable=False, index=True)

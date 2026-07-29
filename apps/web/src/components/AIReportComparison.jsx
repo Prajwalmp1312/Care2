@@ -67,6 +67,49 @@ const AIReportComparison = ({ records = [] }) => {
     }
   };
 
+  const exportComparison = (format) => {
+    if (!comparison) return;
+
+    let content;
+    let mediaType;
+    if (format === "json") {
+      content = JSON.stringify(comparison, null, 2);
+      mediaType = "application/json";
+    } else {
+      const escapeCsv = (value) =>
+        `"${String(value ?? "").replaceAll('"', '""')}"`;
+      const rows = [
+        ["AI Report Comparison"],
+        ["First report", comparison.first_record?.name],
+        ["Second report", comparison.second_record?.name],
+        ["Summary", comparison.ai_summary || comparison.summary],
+        [],
+        ["Metric", "First value", "Second value", "Difference", "Status"],
+        ...(comparison.metric_comparison || []).map((metric) => [
+          metric.metric,
+          metric.first_value,
+          metric.second_value,
+          metric.difference,
+          metric.status,
+        ]),
+        [],
+        ["Improved items", ...(comparison.improved_items || [])],
+        ["Worsened items", ...(comparison.worsened_items || [])],
+        ["New concerns", ...(comparison.new_concerns || [])],
+        ["Recommended next steps", ...(comparison.recommended_next_steps || [])],
+      ];
+      content = rows.map((row) => row.map(escapeCsv).join(",")).join("\r\n");
+      mediaType = "text/csv";
+    }
+
+    const url = URL.createObjectURL(new Blob([content], { type: mediaType }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `careconnect-report-comparison.${format}`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
   const renderList = (title, items, icon, emptyText) => (
     <div className="bg-white border border-gray-100 rounded-xl p-5 shadow-sm">
       <h4 className="font-bold text-gray-800 mb-3 flex items-center gap-2">
@@ -273,7 +316,25 @@ const AIReportComparison = ({ records = [] }) => {
       {comparison && (
         <div className="mt-8 space-y-6">
           <div className="bg-gradient-to-r from-indigo-600 to-purple-600 text-white rounded-xl p-6">
-            <h4 className="text-lg font-bold mb-2">Comparison Summary</h4>
+            <div className="mb-2 flex flex-wrap items-center justify-between gap-3">
+              <h4 className="text-lg font-bold">Comparison Summary</h4>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => exportComparison("csv")}
+                  className="rounded-lg bg-white/15 px-3 py-2 text-xs font-bold hover:bg-white/25"
+                >
+                  <i className="fas fa-download mr-2"></i>CSV
+                </button>
+                <button
+                  type="button"
+                  onClick={() => exportComparison("json")}
+                  className="rounded-lg bg-white/15 px-3 py-2 text-xs font-bold hover:bg-white/25"
+                >
+                  <i className="fas fa-download mr-2"></i>JSON
+                </button>
+              </div>
+            </div>
             <p className="text-sm leading-6">
               {comparison.ai_summary || comparison.summary}
             </p>

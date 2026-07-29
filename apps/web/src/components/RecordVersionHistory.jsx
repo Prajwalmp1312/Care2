@@ -89,9 +89,23 @@ const RecordVersionHistory = ({ record, onClose, onVersionUploaded }) => {
     }
   };
 
-  const downloadVersion = (versionId) => {
-    const downloadUrl = `/api/records/versions/${versionId}/download?token=${token}`;
-    window.open(downloadUrl, "_blank");
+  const downloadVersion = async (version) => {
+    try {
+      const response = await axios.get(
+        `/api/records/versions/${version.id}/download`,
+        { responseType: "blob" },
+      );
+      const objectUrl = URL.createObjectURL(response.data);
+      const link = document.createElement("a");
+      link.href = objectUrl;
+      link.download = version.file_name || `record-version-${version.id}`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(objectUrl);
+    } catch (err) {
+      setError(err.response?.data?.detail || "Failed to download version");
+    }
   };
 
  const deleteVersion = async (versionId) => {
@@ -336,7 +350,7 @@ const RecordVersionHistory = ({ record, onClose, onVersionUploaded }) => {
 
                     <div className="flex gap-2">
                       <button
-                        onClick={() => downloadVersion(version.id)}
+                        onClick={() => downloadVersion(version)}
                         className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg text-sm"
                       >
                         <i className="fas fa-download mr-2"></i>

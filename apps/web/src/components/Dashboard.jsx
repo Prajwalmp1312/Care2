@@ -21,19 +21,103 @@ import AIReportComparison from "./AIReportComparison";
 import PatientHealthTimeline from "./PatientHealthTimeline";
 import EmergencyAlertButton from "./EmergencyAlertButton";
 import EmergencyAlerts from "./EmergencyAlerts";
+import ClinicalSearch from "./ClinicalSearch";
+import SecuritySessions from "./SecuritySessions";
+import AuthenticatedAttachment from "./AuthenticatedAttachment";
+import RoleDashboardWidgets from "./RoleDashboardWidgets";
+import AdminAnalytics from "./AdminAnalytics";
+import ClinicalExportButton from "./ClinicalExportButton";
+import ChatProductivityToolbar from "./ChatProductivityToolbar";
 
 const MealPlanner = lazy(() => import("../meal-planner/MealPlanner"));
 
 const getDashboardStorageKey = (role, key) =>
   `careconnect:${role || "guest"}:${key}`;
 
+const healthStatusPresentations = {
+  Critical: {
+    icon: "fa-triangle-exclamation",
+    badge: "bg-red-100 text-red-700 ring-red-200",
+    iconBox: "bg-red-100 text-red-600",
+    accent: "from-red-500 via-rose-500 to-orange-400",
+    message: "Some results may need prompt medical attention.",
+  },
+  "Needs Attention": {
+    icon: "fa-circle-exclamation",
+    badge: "bg-amber-100 text-amber-800 ring-amber-200",
+    iconBox: "bg-amber-100 text-amber-600",
+    accent: "from-amber-400 via-orange-400 to-rose-400",
+    message: "A few results are outside the expected range.",
+  },
+  Good: {
+    icon: "fa-circle-check",
+    badge: "bg-emerald-100 text-emerald-700 ring-emerald-200",
+    iconBox: "bg-emerald-100 text-emerald-600",
+    accent: "from-emerald-400 via-teal-400 to-cyan-400",
+    message: "Your analyzed records show no major concerns.",
+  },
+  Unknown: {
+    icon: "fa-circle-info",
+    badge: "bg-slate-100 text-slate-700 ring-slate-200",
+    iconBox: "bg-slate-100 text-slate-600",
+    accent: "from-slate-400 via-blue-400 to-indigo-400",
+    message: "More health information is needed for an assessment.",
+  },
+};
+
+const healthVitalPresentations = {
+  blood_pressure: {
+    label: "Blood pressure",
+    icon: "fa-heart-pulse",
+    iconClasses: "bg-rose-50 text-rose-600",
+  },
+  heart_rate: {
+    label: "Heart rate",
+    icon: "fa-wave-square",
+    iconClasses: "bg-blue-50 text-blue-600",
+  },
+  temperature: {
+    label: "Temperature",
+    icon: "fa-temperature-half",
+    iconClasses: "bg-orange-50 text-orange-600",
+  },
+};
+
+const recordCategoryOptions = [
+  ["laboratory", "Laboratory"],
+  ["imaging", "Imaging"],
+  ["visit_note", "Visit Note"],
+  ["discharge_summary", "Discharge Summary"],
+  ["prescription", "Prescription"],
+  ["immunization", "Immunization"],
+  ["allergy", "Allergy"],
+  ["vital_signs", "Vital Signs"],
+  ["procedure", "Procedure"],
+  ["referral", "Referral"],
+  ["insurance", "Insurance"],
+  ["other", "Other"],
+];
+
 const Dashboard = () => {
   const { user, logout, loading: authLoading } = useAuth();
   const navigate = useNavigate();
   const [currentView, setCurrentView] = useState("dashboard");
   const [clinicalProfileTarget, setClinicalProfileTarget] = useState(null);
+  const [showFullTimelineModal, setShowFullTimelineModal] = useState(false);
+  const [showFullClinicalSearchModal, setShowFullClinicalSearchModal] =
+    useState(false);
   const [prescriptionPatientEmail, setPrescriptionPatientEmail] = useState("");
   const [records, setRecords] = useState([]);
+  const [recordSearch, setRecordSearch] = useState("");
+  const [recordCategoryFilter, setRecordCategoryFilter] = useState("all");
+  const [showRecordUploadModal, setShowRecordUploadModal] = useState(false);
+  const [pendingRecordFile, setPendingRecordFile] = useState(null);
+  const [recordUploadMetadata, setRecordUploadMetadata] = useState({
+    categoryCode: "other",
+    recordType: "Medical Report",
+    sourceDate: "",
+    tags: "",
+  });
   const [healthSummary, setHealthSummary] = useState(null);
   const [loading, setLoading] = useState(false);
 
@@ -48,6 +132,7 @@ const Dashboard = () => {
   const [selectedConversation, setSelectedConversation] = useState(null);
   const [conversationMessages, setConversationMessages] = useState([]);
   const [newMessage, setNewMessage] = useState("");
+  const [messageSearch, setMessageSearch] = useState("");
   const [messagingView, setMessagingView] = useState("browse");
   const conversationScrollRef = useRef(null);
   const [editingMessageId, setEditingMessageId] = useState(null);
@@ -74,6 +159,7 @@ const Dashboard = () => {
   const [allClinicians, setAllClinicians] = useState([]);
   const [clinicianSearch, setClinicianSearch] = useState("");
   const [auditLogs, setAuditLogs] = useState([]);
+  const [securityAuditEvents, setSecurityAuditEvents] = useState([]);
   const [adminView, setAdminView] = useState("dashboard");
 
   const [clinicianApprovalStatus, setClinicianApprovalStatus] = useState(null);
@@ -118,6 +204,21 @@ const Dashboard = () => {
     { name: "UK", code: "+44", maxLength: 10 },
     { name: "Australia", code: "+61", maxLength: 9 },
   ];
+
+  const filteredRecords = useMemo(() => {
+    const search = recordSearch.trim().toLowerCase();
+    return records.filter((record) => {
+      const matchesCategory =
+        recordCategoryFilter === "all" ||
+        record.category_code === recordCategoryFilter;
+      const matchesSearch =
+        !search ||
+        [record.name, record.type, record.category, ...(record.tags || [])]
+          .filter(Boolean)
+          .some((value) => String(value).toLowerCase().includes(search));
+      return matchesCategory && matchesSearch;
+    });
+  }, [recordCategoryFilter, recordSearch, records]);
 
   const openVersionHistory = (record) => {
     setVersionRecord(record);
@@ -176,8 +277,17 @@ const Dashboard = () => {
       getDashboardStorageKey(user.role, "currentView"),
     );
     const adminHiddenViews = ["appointments", "prescriptions"];
+    const patientDashboardViews = [
+      "timeline",
+      "clinical-search",
+      "emergency-alerts",
+    ];
 
-    if (user.role === "admin" && adminHiddenViews.includes(savedCurrentView)) {
+    if (
+      (user.role === "admin" && adminHiddenViews.includes(savedCurrentView)) ||
+      (user.role === "patient" &&
+        patientDashboardViews.includes(savedCurrentView))
+    ) {
       setCurrentView("dashboard");
       localStorage.setItem(
         getDashboardStorageKey(user.role, "currentView"),
@@ -530,9 +640,12 @@ const Dashboard = () => {
       const res = await axios.get("/api/conversations", {
         headers: { Authorization: `Bearer ${token}` },
       });
-      setConversations(res.data.conversations);
+      const nextConversations = res.data.conversations || [];
+      setConversations(nextConversations);
+      return nextConversations;
     } catch (err) {
       console.error("Error loading conversations:", err);
+      return [];
     }
   };
 
@@ -575,6 +688,33 @@ const Dashboard = () => {
       setConversationMessages(messagesWithAttachments);
     } catch (err) {
       console.error("Error loading messages:", err);
+    }
+  };
+
+  const openPatientConversation = async (patient) => {
+    let availableConversations = conversations;
+    let conversation = availableConversations.find(
+      (item) => item.other_user_email === patient.email,
+    );
+    if (!conversation) {
+      availableConversations = await loadConversations();
+      conversation = availableConversations.find(
+        (item) => item.other_user_email === patient.email,
+      );
+    }
+
+    setCurrentView("messages");
+    setMessagingView("conversations");
+    setSelectedConversation(conversation || null);
+    if (conversation) {
+      loadConversationMessages(conversation.other_user_email);
+      setConversations((current) =>
+        current.map((item) =>
+          item.conversation_id === conversation.conversation_id
+            ? { ...item, unread_count: 0 }
+            : item,
+        ),
+      );
     }
   };
 
@@ -762,22 +902,43 @@ const Dashboard = () => {
     }
   };
 
-  const handleUpload = async (e) => {
-    const file = e.target.files[0];
+  const handleUpload = (e) => {
+    const file = e.target.files?.[0];
     if (!file) return;
+    e.target.value = "";
+
+    if (file.size > 20 * 1024 * 1024) {
+      alert("Medical record uploads must be 20 MB or smaller.");
+      return;
+    }
+
+    setPendingRecordFile(file);
+    setUploadFileName(file.name);
+    setShowRecordUploadModal(true);
+  };
+
+  const submitRecordUpload = async (e) => {
+    e.preventDefault();
+    if (!pendingRecordFile) return;
 
     setIsUploading(true);
-    setUploadFileName(file.name);
     setUploadProgress(0);
 
     const formData = new FormData();
-    formData.append("file", file);
-    formData.append("category", "General");
-    formData.append("record_type", "Medical Report");
-    console.log("TOKEN:", localStorage.getItem("access_token"));
+    formData.append("file", pendingRecordFile);
+    formData.append("category", recordUploadMetadata.categoryCode);
+    formData.append("category_code", recordUploadMetadata.categoryCode);
+    formData.append("record_type", recordUploadMetadata.recordType.trim());
+    if (recordUploadMetadata.sourceDate) {
+      formData.append("source_date", recordUploadMetadata.sourceDate);
+    }
+    if (recordUploadMetadata.tags.trim()) {
+      formData.append("tags", recordUploadMetadata.tags.trim());
+    }
+
+    let progressInterval;
     try {
-      // Simulate progress (since we can't track real upload progress easily with axios)
-      const progressInterval = setInterval(() => {
+      progressInterval = setInterval(() => {
         setUploadProgress((prev) => {
           if (prev >= 90) {
             clearInterval(progressInterval);
@@ -795,23 +956,21 @@ const Dashboard = () => {
 
       clearInterval(progressInterval);
       setUploadProgress(100);
+      setShowRecordUploadModal(false);
+      setPendingRecordFile(null);
 
-      // Wait a moment to show 100% before hiding
       setTimeout(() => {
         setIsUploading(false);
         setUploadProgress(0);
         setUploadFileName("");
         loadData();
-      }, 1000);
+      }, 500);
     } catch (err) {
+      if (progressInterval) clearInterval(progressInterval);
       setIsUploading(false);
       setUploadProgress(0);
-      setUploadFileName("");
-      alert("Error uploading file");
+      alert(err.response?.data?.detail || "Error uploading medical record");
     }
-
-    // Reset file input
-    e.target.value = "";
   };
 
   useEffect(() => {
@@ -835,6 +994,7 @@ const Dashboard = () => {
         requestsResult,
         cliniciansResult,
         logsResult,
+        securityLogsResult,
         patientsResult,
       ] = await Promise.allSettled([
         axios.get("/api/admin/dashboard-stats", {
@@ -847,6 +1007,9 @@ const Dashboard = () => {
           headers: { Authorization: `Bearer ${token}` },
         }),
         axios.get("/api/admin/audit-logs", {
+          headers: { Authorization: `Bearer ${token}` },
+        }),
+        axios.get("/api/admin/security-audit?limit=100", {
           headers: { Authorization: `Bearer ${token}` },
         }),
         axios.get("/api/admin/patients", {
@@ -862,6 +1025,8 @@ const Dashboard = () => {
         setAllClinicians(cliniciansResult.value.data.clinicians || []);
       if (logsResult.status === "fulfilled")
         setAuditLogs(logsResult.value.data.logs || []);
+      if (securityLogsResult.status === "fulfilled")
+        setSecurityAuditEvents(securityLogsResult.value.data.events || []);
       if (patientsResult.status === "fulfilled") {
         setAllPatients(patientsResult.value.data.patients || []);
       } else {
@@ -1076,6 +1241,50 @@ const Dashboard = () => {
     0,
   );
 
+  const visibleConversationMessages = useMemo(() => {
+    const search = messageSearch.trim().toLowerCase();
+    if (!search) return conversationMessages;
+    return conversationMessages.filter((message) =>
+      [
+        message.message,
+        message.attachment?.file_name,
+        message.prescription?.diagnosis,
+        ...(message.prescription?.medicines || []).map(
+          (medicine) => medicine.medicine_name,
+        ),
+      ]
+        .filter(Boolean)
+        .some((value) => String(value).toLowerCase().includes(search)),
+    );
+  }, [conversationMessages, messageSearch]);
+
+  const exportCurrentConversation = () => {
+    if (!selectedConversation || !conversationMessages.length) return;
+    const escapeCsv = (value) =>
+      `"${String(value ?? "").replaceAll('"', '""')}"`;
+    const rows = [
+      ["Sent at", "Sender", "Recipient", "Message", "Attachment", "Prescription"],
+      ...conversationMessages.map((message) => [
+        message.sent_at,
+        message.sender_email || (message.is_mine ? user?.email : selectedConversation.other_user_email),
+        message.recipient_email || (message.is_mine ? selectedConversation.other_user_email : user?.email),
+        message.message || "",
+        message.attachment?.file_name || "",
+        message.prescription?.id ? `Prescription #${message.prescription.id}` : "",
+      ]),
+    ];
+    const csv = rows.map((row) => row.map(escapeCsv).join(",")).join("\r\n");
+    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `careconnect-chat-${selectedConversation.other_user_email.replace(
+      /[^a-z0-9_-]/gi,
+      "_",
+    )}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
   const filteredClinicians = useMemo(() => {
     const searchTerm = clinicianSearch.trim().toLowerCase();
 
@@ -1225,6 +1434,10 @@ const Dashboard = () => {
   }, [conversationMessages, selectedConversation]);
 
   useEffect(() => {
+    setMessageSearch("");
+  }, [selectedConversation?.other_user_email]);
+
+  useEffect(() => {
     if (!adminSelectedConversation || !adminConversationScrollRef.current)
       return;
 
@@ -1323,6 +1536,18 @@ const Dashboard = () => {
                       <i className="fas fa-user-circle text-blue-600"></i>
                       <span className="text-gray-700 font-medium">
                         User Details
+                      </span>
+                    </button>
+                    <button
+                      onClick={() => {
+                        setCurrentView("security");
+                        setShowProfileDropdown(false);
+                      }}
+                      className="w-full px-4 py-3 text-left hover:bg-gray-50 flex items-center gap-3 transition border-t"
+                    >
+                      <i className="fas fa-shield-alt text-indigo-600"></i>
+                      <span className="text-gray-700 font-medium">
+                        Security & Sessions
                       </span>
                     </button>
                     <button
@@ -1873,6 +2098,187 @@ const Dashboard = () => {
         )}
       </AnimatePresence>
 
+      <AnimatePresence>
+        {showRecordUploadModal && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm"
+            onClick={() => {
+              if (!isUploading) {
+                setShowRecordUploadModal(false);
+                setPendingRecordFile(null);
+              }
+            }}
+          >
+            <motion.form
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              onSubmit={submitRecordUpload}
+              onClick={(event) => event.stopPropagation()}
+              className="w-full max-w-2xl overflow-hidden rounded-2xl bg-white shadow-2xl"
+            >
+              <div className="bg-gradient-to-r from-blue-600 to-indigo-600 p-6 text-white">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <h2 className="text-2xl font-bold">Organize medical record</h2>
+                    <p className="mt-1 text-sm text-blue-100">
+                      Confirm the category and source details before upload.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={isUploading}
+                    onClick={() => {
+                      setShowRecordUploadModal(false);
+                      setPendingRecordFile(null);
+                    }}
+                    className="flex h-9 w-9 items-center justify-center rounded-full bg-white/20 hover:bg-white/30 disabled:opacity-50"
+                  >
+                    <i className="fas fa-times"></i>
+                  </button>
+                </div>
+              </div>
+
+              <div className="space-y-5 p-6">
+                <div className="rounded-lg border border-blue-100 bg-blue-50 p-4">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-blue-600">
+                    Selected file
+                  </p>
+                  <p className="mt-1 break-all font-semibold text-gray-800">
+                    {pendingRecordFile?.name}
+                  </p>
+                  <p className="text-xs text-gray-500">
+                    {pendingRecordFile
+                      ? `${(pendingRecordFile.size / (1024 * 1024)).toFixed(2)} MB`
+                      : ""}
+                  </p>
+                </div>
+
+                <div className="grid gap-4 md:grid-cols-2">
+                  <div>
+                    <label className="mb-1 block text-sm font-semibold text-gray-700">
+                      Category
+                    </label>
+                    <select
+                      required
+                      value={recordUploadMetadata.categoryCode}
+                      onChange={(event) =>
+                        setRecordUploadMetadata((current) => ({
+                          ...current,
+                          categoryCode: event.target.value,
+                        }))
+                      }
+                      className="w-full rounded-lg border border-gray-300 px-3 py-3"
+                    >
+                      {recordCategoryOptions.map(([code, label]) => (
+                        <option key={code} value={code}>
+                          {label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="mb-1 block text-sm font-semibold text-gray-700">
+                      Record type
+                    </label>
+                    <input
+                      required
+                      maxLength={100}
+                      value={recordUploadMetadata.recordType}
+                      onChange={(event) =>
+                        setRecordUploadMetadata((current) => ({
+                          ...current,
+                          recordType: event.target.value,
+                        }))
+                      }
+                      placeholder="Example: Complete blood count"
+                      className="w-full rounded-lg border border-gray-300 px-3 py-3"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="mb-1 block text-sm font-semibold text-gray-700">
+                      Clinical/source date
+                    </label>
+                    <input
+                      type="date"
+                      value={recordUploadMetadata.sourceDate}
+                      onChange={(event) =>
+                        setRecordUploadMetadata((current) => ({
+                          ...current,
+                          sourceDate: event.target.value,
+                        }))
+                      }
+                      className="w-full rounded-lg border border-gray-300 px-3 py-3"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="mb-1 block text-sm font-semibold text-gray-700">
+                      Tags
+                    </label>
+                    <input
+                      value={recordUploadMetadata.tags}
+                      onChange={(event) =>
+                        setRecordUploadMetadata((current) => ({
+                          ...current,
+                          tags: event.target.value,
+                        }))
+                      }
+                      placeholder="annual, cardiology, follow-up"
+                      className="w-full rounded-lg border border-gray-300 px-3 py-3"
+                    />
+                    <p className="mt-1 text-xs text-gray-500">
+                      Separate up to 10 tags with commas.
+                    </p>
+                  </div>
+                </div>
+
+                {isUploading && (
+                  <div>
+                    <div className="mb-1 flex justify-between text-xs font-semibold text-gray-600">
+                      <span>Validating and analyzing upload</span>
+                      <span>{uploadProgress}%</span>
+                    </div>
+                    <div className="h-2 overflow-hidden rounded-full bg-gray-200">
+                      <div
+                        className="h-full bg-blue-600 transition-all"
+                        style={{ width: `${uploadProgress}%` }}
+                      ></div>
+                    </div>
+                  </div>
+                )}
+
+                <div className="flex justify-end gap-3 border-t pt-4">
+                  <button
+                    type="button"
+                    disabled={isUploading}
+                    onClick={() => {
+                      setShowRecordUploadModal(false);
+                      setPendingRecordFile(null);
+                    }}
+                    className="rounded-lg border border-gray-300 px-5 py-2.5 font-semibold text-gray-700 disabled:opacity-50"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={isUploading || !recordUploadMetadata.recordType.trim()}
+                    className="rounded-lg bg-blue-600 px-5 py-2.5 font-semibold text-white hover:bg-blue-700 disabled:opacity-50"
+                  >
+                    {isUploading ? "Uploading..." : "Upload securely"}
+                  </button>
+                </div>
+              </div>
+            </motion.form>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Navigation Tabs */}
       <div className="flex justify-center mt-6 gap-3 flex-wrap">
         {tabButton(
@@ -1884,14 +2290,18 @@ const Dashboard = () => {
         {user?.role !== "admin" &&
           tabButton("messages", "Messages", "fa-comments")}
 
+        {["clinician", "admin"].includes(user?.role) &&
+          tabButton("clinical-search", "Clinical Search", "fa-search")}
+
         {user?.role === "patient" &&
           tabButton("records", "Records", "fa-file-medical")}
 
-        {user?.role === "patient" &&
-          tabButton("timeline", "Timeline", "fa-timeline")}
-
-        {["patient", "admin", "clinician"].includes(user?.role) &&
-  tabButton("emergency-alerts", "Emergency Alerts", "fa-triangle-exclamation")}  
+        {["admin", "clinician"].includes(user?.role) &&
+          tabButton(
+            "emergency-alerts",
+            "Emergency Alerts",
+            "fa-triangle-exclamation",
+          )}
 
         {user?.role === "patient" &&
           tabButton("meal-planner", "Meal Planner", "fa-utensils")}
@@ -2006,12 +2416,14 @@ const Dashboard = () => {
               </motion.div>
             </div>
 
+            <RoleDashboardWidgets />
+
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
               {/* Main Content - 2/3 width */}
               <div className="lg:col-span-2 space-y-6">
                 {/* Pending Requests */}
                 <motion.div
-                  className="bg-white shadow-lg rounded-xl p-6 border border-gray-100"
+                  className="overflow-hidden rounded-2xl border border-slate-200 bg-white p-6 shadow-lg shadow-slate-200/60"
                   initial={{ y: 20, opacity: 0 }}
                   animate={{ y: 0, opacity: 1 }}
                   transition={{ delay: 0.5 }}
@@ -2909,6 +3321,8 @@ const Dashboard = () => {
               </motion.div>
             </div>
 
+            <RoleDashboardWidgets />
+
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
               {/* Main Content - 2/3 width */}
               <div className="lg:col-span-2 space-y-6">
@@ -2919,26 +3333,29 @@ const Dashboard = () => {
                   animate={{ y: 0, opacity: 1 }}
                   transition={{ delay: 0.5 }}
                 >
-                  <div className="flex items-center justify-between mb-4">
-                    <h3 className="text-xl font-bold text-gray-800">
+                  <div className="mb-5 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+                    <h3 className="flex items-center gap-3 text-xl font-bold text-slate-900">
+                      <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-blue-50 to-indigo-100 text-blue-600 ring-1 ring-blue-100">
+                        <i className="fas fa-wand-magic-sparkles text-sm"></i>
+                      </span>
                       AI Health Summary
                     </h3>
 
                     <button
                       onClick={() => setCurrentView("records")}
-                      className="text-blue-600 hover:text-blue-700 text-sm font-medium"
+                      className="rounded-lg bg-blue-600 px-3 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-blue-700"
                     >
                       View All Records →
                     </button>
                     <button
-                      onClick={() => setCurrentView("timeline")}
-                      className="text-indigo-600 hover:text-indigo-700 text-sm font-medium"
+                      onClick={() => setShowFullTimelineModal(true)}
+                      className="rounded-lg px-3 py-2 text-sm font-semibold text-indigo-600 transition hover:bg-indigo-50"
                     >
                       View Health Timeline →
                     </button>
                   </div>
                   {records.length === 0 ? (
-                    <div className="text-center p-10 bg-blue-50 rounded-lg border-2 border-dashed border-blue-200">
+                    <div className="rounded-xl border-2 border-dashed border-blue-200 bg-blue-50 p-10 text-center">
                       <i className="fas fa-upload text-4xl text-blue-500 mb-3"></i>
                       <p className="text-gray-600 mb-2">
                         No health records found. Upload your first report:
@@ -2953,14 +3370,128 @@ const Dashboard = () => {
                       </label>
                     </div>
                   ) : (
-                    <div className="bg-gradient-to-r from-blue-100 to-blue-50 p-6 rounded-lg">
-                      <p className="text-gray-700 leading-relaxed">
-                        {records.length === 0
-                          ? "Upload medical records to generate health insights."
-                          : healthSummary?.summary
-                            ? healthSummary.summary
-                            : "Analyzing medical records..."}
-                      </p>
+                    <div>
+                      {!healthSummary ? (
+                        <div className="space-y-3 rounded-xl bg-slate-50 p-5">
+                          <div className="h-5 w-40 animate-pulse rounded bg-slate-200"></div>
+                          <div className="h-4 w-full animate-pulse rounded bg-slate-200"></div>
+                          <div className="h-4 w-3/4 animate-pulse rounded bg-slate-200"></div>
+                        </div>
+                      ) : (
+                        <>
+                          <div
+                            className={`mb-4 h-1.5 rounded-full bg-gradient-to-r ${
+                              (healthStatusPresentations[healthSummary.overall_status] ||
+                                healthStatusPresentations.Unknown).accent
+                            }`}
+                          />
+                          <div className="flex flex-col gap-4 rounded-xl border border-slate-200 bg-gradient-to-br from-slate-50 to-white p-4 sm:flex-row sm:items-center sm:justify-between">
+                            <div className="flex items-center gap-4">
+                              <div
+                                className={`flex h-12 w-12 shrink-0 items-center justify-center rounded-xl text-xl ${
+                                  (healthStatusPresentations[healthSummary.overall_status] ||
+                                    healthStatusPresentations.Unknown).iconBox
+                                }`}
+                              >
+                                <i
+                                  className={`fas ${
+                                    (healthStatusPresentations[healthSummary.overall_status] ||
+                                      healthStatusPresentations.Unknown).icon
+                                  }`}
+                                ></i>
+                              </div>
+                              <div>
+                                <p className="mb-1 text-xs font-semibold uppercase tracking-wider text-slate-500">Overall status</p>
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <span
+                                    className={`rounded-full px-3 py-1 text-sm font-bold ring-1 ring-inset ${
+                                      (healthStatusPresentations[healthSummary.overall_status] ||
+                                        healthStatusPresentations.Unknown).badge
+                                    }`}
+                                  >
+                                    {healthSummary.overall_status || "Unknown"}
+                                  </span>
+                                  <span className="text-sm text-slate-600">
+                                    {(healthStatusPresentations[healthSummary.overall_status] ||
+                                      healthStatusPresentations.Unknown).message}
+                                  </span>
+                                </div>
+                              </div>
+                            </div>
+                            <div className="shrink-0 rounded-xl bg-white px-5 py-2.5 text-center shadow-sm ring-1 ring-slate-200">
+                              <p className="text-2xl font-bold text-slate-900">{healthSummary.total_records ?? records.length}</p>
+                              <p className="text-xs text-slate-500">records analyzed</p>
+                            </div>
+                          </div>
+
+                          {Object.keys(healthSummary.vital_trends || {}).length > 0 && (
+                            <section className="mt-5">
+                              <div className="mb-3 flex items-center justify-between">
+                                <h4 className="text-sm font-bold text-slate-800">Latest health signals</h4>
+                                <span className="text-xs text-slate-400">Recent averages</span>
+                              </div>
+                              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
+                                {Object.entries(healthSummary.vital_trends).map(([key, value]) => {
+                                  const vital = healthVitalPresentations[key] || {
+                                    label: key.replaceAll("_", " "),
+                                    icon: "fa-chart-simple",
+                                    iconClasses: "bg-violet-50 text-violet-600",
+                                  };
+                                  return (
+                                    <div key={key} className="flex items-center gap-3 rounded-xl border border-slate-200 bg-white p-3 transition hover:-translate-y-0.5 hover:shadow-md">
+                                      <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg ${vital.iconClasses}`}>
+                                        <i className={`fas ${vital.icon}`}></i>
+                                      </div>
+                                      <div className="min-w-0">
+                                        <p className="text-xs font-medium capitalize text-slate-500">{vital.label}</p>
+                                        <p className="truncate font-bold text-slate-900">{value}</p>
+                                      </div>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </section>
+                          )}
+
+                          <div className="mt-5 grid grid-cols-1 gap-4 md:grid-cols-2">
+                            <section className="rounded-xl border border-slate-200 bg-white p-4">
+                              <div className="mb-3 flex items-center gap-2">
+                                <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-indigo-50 text-indigo-600"><i className="fas fa-clipboard-check text-sm"></i></div>
+                                <h4 className="font-bold text-slate-900">Key findings</h4>
+                              </div>
+                              <ul className="space-y-2.5">
+                                {(healthSummary.recent_findings || []).slice(0, 4).map((finding, index) => (
+                                  <li key={index} className="flex gap-2.5 text-sm leading-5 text-slate-600">
+                                    <span className="mt-2 h-1.5 w-1.5 shrink-0 rounded-full bg-indigo-500"></span>
+                                    <span>{finding}</span>
+                                  </li>
+                                ))}
+                                {!healthSummary.recent_findings?.length && <li className="text-sm text-slate-500">No structured findings were detected.</li>}
+                              </ul>
+                            </section>
+
+                            <section className="rounded-xl border border-blue-100 bg-blue-50/70 p-4">
+                              <div className="mb-3 flex items-center gap-2">
+                                <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-blue-100 text-blue-700"><i className="fas fa-stethoscope text-sm"></i></div>
+                                <h4 className="font-bold text-slate-900">Recommended next steps</h4>
+                              </div>
+                              <ul className="space-y-2.5">
+                                {(healthSummary.recommendations || []).slice(0, 4).map((recommendation, index) => (
+                                  <li key={index} className="flex gap-2.5 text-sm leading-5 text-slate-700">
+                                    <i className="fas fa-check mt-1 text-xs text-blue-600"></i>
+                                    <span>{recommendation}</span>
+                                  </li>
+                                ))}
+                              </ul>
+                            </section>
+                          </div>
+
+                          <div className="mt-4 flex items-start gap-2 rounded-lg bg-slate-50 px-3 py-2.5 text-xs leading-5 text-slate-500">
+                            <i className="fas fa-shield-heart mt-1 text-slate-400"></i>
+                            <span>This AI-generated overview is informational and does not replace advice from a qualified healthcare professional.</span>
+                          </div>
+                        </>
+                      )}
                     </div>
                   )}
                 </motion.div>
@@ -3225,6 +3756,20 @@ const Dashboard = () => {
                 </motion.div>
               </div>
             </div>
+
+            <div className="grid grid-cols-1 gap-6 xl:grid-cols-2">
+              <PatientHealthTimeline
+                compact
+                recentLimit={4}
+                onViewAll={() => setShowFullTimelineModal(true)}
+              />
+              <ClinicalSearch
+                compact
+                user={user}
+                onViewAll={() => setShowFullClinicalSearchModal(true)}
+                onOpenRecord={(recordId) => loadRecordDetails(recordId)}
+              />
+            </div>
           </div>
         )}
 
@@ -3322,6 +3867,8 @@ const Dashboard = () => {
               </motion.div>
             </div>
 
+            <RoleDashboardWidgets />
+
             {/* Admin Sub-Navigation */}
             <div className="bg-white rounded-xl p-4 shadow-md">
               <div className="flex gap-2 flex-wrap">
@@ -3334,6 +3881,16 @@ const Dashboard = () => {
                   }`}
                 >
                   <i className="fas fa-chart-pie mr-2"></i>Overview
+                </button>
+                <button
+                  onClick={() => setAdminView("analytics")}
+                  className={`px-4 py-2 rounded-lg font-medium transition ${
+                    adminView === "analytics"
+                      ? "bg-purple-600 text-white"
+                      : "bg-gray-100 text-gray-700 hover:bg-gray-200"
+                  }`}
+                >
+                  <i className="fas fa-chart-line mr-2"></i>Analytics
                 </button>
                 <button
                   onClick={() => setAdminView("requests")}
@@ -3397,6 +3954,8 @@ const Dashboard = () => {
             </div>
 
             {/* Admin Content Based on View */}
+            {adminView === "analytics" && <AdminAnalytics />}
+
             {adminView === "dashboard" && (
               <div className="space-y-6">
                 <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
@@ -4574,9 +5133,12 @@ const Dashboard = () => {
                 initial={{ y: 20, opacity: 0 }}
                 animate={{ y: 0, opacity: 1 }}
               >
-                <h3 className="text-xl font-bold text-gray-800 mb-4">
-                  Audit Logs
+                <h3 className="text-xl font-bold text-gray-800 mb-1">
+                  Administrative Audit Logs
                 </h3>
+                <p className="mb-4 text-sm text-gray-500">
+                  Explicit account and clinician-administration actions.
+                </p>
                 <div className="space-y-2 max-h-96 overflow-y-auto">
                   {auditLogs.map((log) => (
                     <div
@@ -4604,6 +5166,62 @@ const Dashboard = () => {
                   {auditLogs.length === 0 && (
                     <div className="text-center py-12 text-gray-500">
                       <p>No audit logs found</p>
+                    </div>
+                  )}
+                </div>
+
+                <div className="my-6 border-t border-gray-200"></div>
+
+                <h3 className="text-xl font-bold text-gray-800 mb-1">
+                  Security & Access Audit
+                </h3>
+                <p className="mb-4 text-sm text-gray-500">
+                  Sensitive reads, changes, denied requests, and session activity.
+                </p>
+                <div className="space-y-2 max-h-[32rem] overflow-y-auto">
+                  {securityAuditEvents.map((event) => (
+                    <div
+                      key={event.id}
+                      className="rounded-lg border border-gray-200 p-4"
+                    >
+                      <div className="flex flex-col justify-between gap-2 md:flex-row md:items-start">
+                        <div>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <p className="font-semibold text-gray-800">
+                              {event.action}
+                            </p>
+                            <span
+                              className={`rounded-full px-2 py-0.5 text-xs font-semibold ${
+                                event.outcome === "success"
+                                  ? "bg-green-100 text-green-700"
+                                  : event.outcome === "denied"
+                                    ? "bg-orange-100 text-orange-700"
+                                    : "bg-red-100 text-red-700"
+                              }`}
+                            >
+                              {event.outcome}
+                            </span>
+                          </div>
+                          <p className="mt-1 text-xs text-gray-500">
+                            Actor: {event.actor_email || "Unauthenticated"} · Role:{" "}
+                            {event.actor_role || "none"} · IP:{" "}
+                            {event.ip_address || "unknown"}
+                          </p>
+                          <p className="mt-1 text-xs text-gray-400">
+                            Request ID: {event.request_id || "not available"}
+                          </p>
+                        </div>
+                        <span className="text-xs text-gray-500">
+                          {event.created_at
+                            ? new Date(event.created_at).toLocaleString()
+                            : ""}
+                        </span>
+                      </div>
+                    </div>
+                  ))}
+                  {securityAuditEvents.length === 0 && (
+                    <div className="py-10 text-center text-gray-500">
+                      No security audit events found
                     </div>
                   )}
                 </div>
@@ -4876,29 +5494,36 @@ const Dashboard = () => {
                     </div>
                   </div>
 
-                  {/* Schedule Meeting Button */}
-                  <a
-                    href={`https://comm360.feeltiptop.com/?email=${selectedConversation.other_user_email}&name=${encodeURIComponent(selectedConversation.other_user_name)}`}
-                    target="_blank"
-                    rel="noopener noreferrer"
+                  <button
+                    type="button"
+                    onClick={() => setCurrentView("appointments")}
                     className="flex items-center gap-2 px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition text-sm font-medium"
                   >
-                    <i className="fas fa-calendar-alt"></i>
-                    Schedule Meeting
-                  </a>
+                    <i className="fas fa-video"></i>
+                    Video Appointments
+                  </button>
                 </div>
+
+                <ChatProductivityToolbar
+                  role="patient"
+                  searchTerm={messageSearch}
+                  onSearchChange={setMessageSearch}
+                  onUseTemplate={setNewMessage}
+                  onExport={exportCurrentConversation}
+                  matchCount={visibleConversationMessages.length}
+                />
 
                 {/* Messages */}
                 <div
                   ref={conversationScrollRef}
                   className="flex-1 overflow-y-auto p-4 space-y-3"
                 >
-                  {conversationMessages.map((msg, index) => {
+                  {visibleConversationMessages.map((msg, index) => {
                     const currentDate = formatMessageDate(msg.sent_at);
                     const prevDate =
                       index > 0
                         ? formatMessageDate(
-                            conversationMessages[index - 1].sent_at,
+                            visibleConversationMessages[index - 1].sent_at,
                           )
                         : null;
                     const showDateDivider = prevDate !== currentDate;
@@ -4947,42 +5572,9 @@ const Dashboard = () => {
                                     </button>
                                   </div>
                                 )}
-                                {msg.attachment.file_type === "image" ? (
-                                  <img
-                                    src={`/api/chat/download/${msg.attachment.id}?token=${localStorage.getItem("access_token")}`}
-                                    alt={msg.attachment.file_name}
-                                    className="max-w-full max-h-48 rounded cursor-pointer hover:opacity-90 transition"
-                                    onClick={() =>
-                                      window.open(
-                                        `/api/chat/download/${msg.attachment.id}?token=${localStorage.getItem("access_token")}`,
-                                        "_blank",
-                                      )
-                                    }
-                                  />
-                                ) : (
-                                  <a
-                                    href={`/api/chat/download/${msg.attachment.id}?token=${localStorage.getItem("access_token")}`}
-                                    target="_blank"
-                                    rel="noopener noreferrer"
-                                    className={`flex items-center gap-2 p-2 rounded ${
-                                      msg.is_mine
-                                        ? "bg-blue-700"
-                                        : "bg-gray-300"
-                                    } hover:opacity-80 transition`}
-                                  >
-                                    <i
-                                      className={`fas ${
-                                        msg.attachment.file_type === "pdf"
-                                          ? "fa-file-pdf text-red-500"
-                                          : "fa-file text-gray-600"
-                                      }`}
-                                    ></i>
-                                    <span className="text-sm truncate max-w-[150px]">
-                                      {msg.attachment.file_name}
-                                    </span>
-                                    <i className="fas fa-download text-xs ml-auto"></i>
-                                  </a>
-                                )}
+                                <AuthenticatedAttachment
+                                  attachment={msg.attachment}
+                                />
                               </div>
                             ) : null}
                             {isEditing ? (
@@ -5336,30 +5928,37 @@ const Dashboard = () => {
                       <i className="fas fa-prescription"></i>
                       Create Prescription
                     </button>
-                    {/* Schedule Meeting Button */}
-                    <a
-                      href={`https://comm360.feeltiptop.com/?email=${selectedConversation.other_user_email}&name=${encodeURIComponent(selectedConversation.other_user_name)}`}
-                      target="_blank"
-                      rel="noopener noreferrer"
+                    <button
+                      type="button"
+                      onClick={() => setCurrentView("appointments")}
                       className="flex items-center gap-2 px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition text-sm font-medium"
                     >
-                      <i className="fas fa-calendar-alt"></i>
-                      Schedule Meeting
-                    </a>
+                      <i className="fas fa-video"></i>
+                      Video Appointments
+                    </button>
                   </div>
                 </div>
+
+                <ChatProductivityToolbar
+                  role="clinician"
+                  searchTerm={messageSearch}
+                  onSearchChange={setMessageSearch}
+                  onUseTemplate={setNewMessage}
+                  onExport={exportCurrentConversation}
+                  matchCount={visibleConversationMessages.length}
+                />
 
                 {/* Messages */}
                 <div
                   ref={conversationScrollRef}
                   className="flex-1 overflow-y-auto p-4 space-y-3"
                 >
-                  {conversationMessages.map((msg, index) => {
+                  {visibleConversationMessages.map((msg, index) => {
                     const currentDate = formatMessageDate(msg.sent_at);
                     const prevDate =
                       index > 0
                         ? formatMessageDate(
-                            conversationMessages[index - 1].sent_at,
+                            visibleConversationMessages[index - 1].sent_at,
                           )
                         : null;
                     const showDateDivider = prevDate !== currentDate;
@@ -5408,42 +6007,9 @@ const Dashboard = () => {
                                     </button>
                                   </div>
                                 )}
-                                {msg.attachment.file_type === "image" ? (
-                                  <img
-                                    src={`/api/chat/download/${msg.attachment.id}?token=${localStorage.getItem("access_token")}`}
-                                    alt={msg.attachment.file_name}
-                                    className="max-w-full max-h-48 rounded cursor-pointer hover:opacity-90 transition"
-                                    onClick={() =>
-                                      window.open(
-                                        `/api/chat/download/${msg.attachment.id}?token=${localStorage.getItem("access_token")}`,
-                                        "_blank",
-                                      )
-                                    }
-                                  />
-                                ) : (
-                                  <a
-                                    href={`/api/chat/download/${msg.attachment.id}?token=${localStorage.getItem("access_token")}`}
-                                    target="_blank"
-                                    rel="noopener noreferrer"
-                                    className={`flex items-center gap-2 p-2 rounded ${
-                                      msg.is_mine
-                                        ? "bg-blue-700"
-                                        : "bg-gray-300"
-                                    } hover:opacity-80 transition`}
-                                  >
-                                    <i
-                                      className={`fas ${
-                                        msg.attachment.file_type === "pdf"
-                                          ? "fa-file-pdf text-red-500"
-                                          : "fa-file text-gray-600"
-                                      }`}
-                                    ></i>
-                                    <span className="text-sm truncate max-w-[150px]">
-                                      {msg.attachment.file_name}
-                                    </span>
-                                    <i className="fas fa-download text-xs ml-auto"></i>
-                                  </a>
-                                )}
+                                <AuthenticatedAttachment
+                                  attachment={msg.attachment}
+                                />
                               </div>
                             ) : null}
                             {isEditing ? (
@@ -5594,7 +6160,13 @@ const Dashboard = () => {
           </motion.div>
         )}
         {user?.role !== "admin" && currentView === "appointments" && (
-          <Appointments user={user} />
+          <Appointments
+            user={user}
+            onOpenPatientProfile={(patient) =>
+              setClinicalProfileTarget(patient)
+            }
+            onMessagePatient={openPatientConversation}
+          />
         )}
         {user?.role !== "admin" && currentView === "prescriptions" && (
           <Prescriptions
@@ -5615,13 +6187,23 @@ const Dashboard = () => {
           </Suspense>
         )}
 
-        {currentView === "timeline" && user?.role === "patient" && (
-          <PatientHealthTimeline />
+        {currentView === "clinical-search" &&
+          ["admin", "clinician"].includes(user?.role) && (
+          <ClinicalSearch
+            user={user}
+            onOpenPatient={(patient) => {
+              setClinicalProfileTarget(patient);
+            }}
+            onOpenRecord={(recordId) => loadRecordDetails(recordId)}
+          />
         )}
 
-        {currentView === "emergency-alerts" && ["patient","admin", "clinician"].includes(user?.role) && (
-  <EmergencyAlerts user={user} />
-)}
+        {currentView === "security" && <SecuritySessions />}
+
+        {currentView === "emergency-alerts" &&
+          ["admin", "clinician"].includes(user?.role) && (
+            <EmergencyAlerts user={user} />
+          )}
 
         {/* ===== RECORDS SECTION ===== */}
 
@@ -5643,15 +6225,46 @@ const Dashboard = () => {
                 </p>
               </div>
 
-              <label className="cursor-pointer bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition flex items-center gap-2">
-                <i className="fas fa-upload"></i> Upload Record
+              <div className="flex flex-wrap items-center justify-end gap-2">
+                {user?.role === "patient" && (
+                  <ClinicalExportButton patientEmail={user.email} />
+                )}
+                <label className="cursor-pointer bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition flex items-center gap-2">
+                  <i className="fas fa-upload"></i> Upload Record
+                  <input
+                    type="file"
+                    className="hidden"
+                    accept=".pdf,.jpg,.jpeg,.png,.docx,.doc,.txt,.xls,.xlsx"
+                    onChange={handleUpload}
+                  />
+                </label>
+              </div>
+            </div>
+
+            <div className="mb-6 grid gap-3 rounded-xl border border-gray-200 bg-gray-50 p-4 md:grid-cols-[1fr_240px]">
+              <div className="relative">
+                <i className="fas fa-search absolute left-3 top-3.5 text-gray-400"></i>
                 <input
-                  type="file"
-                  className="hidden"
-                  accept=".pdf,.jpg,.jpeg,.png,.docx,.doc,.txt,.xls,.xlsx"
-                  onChange={handleUpload}
+                  value={recordSearch}
+                  onChange={(event) => setRecordSearch(event.target.value)}
+                  placeholder="Search by name, type, category, or tag..."
+                  className="w-full rounded-lg border border-gray-300 py-3 pl-10 pr-4 focus:border-blue-500 focus:ring-2 focus:ring-blue-200"
                 />
-              </label>
+              </div>
+              <select
+                value={recordCategoryFilter}
+                onChange={(event) =>
+                  setRecordCategoryFilter(event.target.value)
+                }
+                className="rounded-lg border border-gray-300 px-3 py-3"
+              >
+                <option value="all">All record categories</option>
+                {recordCategoryOptions.map(([code, label]) => (
+                  <option key={code} value={code}>
+                    {label}
+                  </option>
+                ))}
+              </select>
             </div>
 
             <AIReportComparison records={records} />
@@ -5677,7 +6290,7 @@ const Dashboard = () => {
               </div>
             ) : (
               <div className="space-y-3">
-                {records.map((record) => (
+                {filteredRecords.map((record) => (
                   <motion.div
                     key={record.id}
                     className="border border-gray-200 rounded-lg p-4 hover:shadow-md transition cursor-pointer bg-gradient-to-r from-white to-blue-50"
@@ -5705,11 +6318,11 @@ const Dashboard = () => {
                             </span>
                             <span
                               className={`px-2 py-0.5 rounded-full text-xs ${
-                                record.category === "Lab Results"
+                                record.category_code === "laboratory"
                                   ? "bg-purple-100 text-purple-700"
-                                  : record.category === "Prescription"
+                                  : record.category_code === "prescription"
                                     ? "bg-green-100 text-green-700"
-                                    : record.category === "Medical Report"
+                                    : record.category_code === "imaging"
                                       ? "bg-blue-100 text-blue-700"
                                       : "bg-gray-100 text-gray-700"
                               }`}
@@ -5717,6 +6330,27 @@ const Dashboard = () => {
                               {record.category}
                             </span>
                           </div>
+
+                          {(record.source_date || record.tags?.length > 0) && (
+                            <div className="mb-2 flex flex-wrap items-center gap-2 text-xs text-gray-500">
+                              {record.source_date && (
+                                <span>
+                                  Clinical date:{" "}
+                                  {new Date(
+                                    `${record.source_date}T00:00:00`,
+                                  ).toLocaleDateString()}
+                                </span>
+                              )}
+                              {(record.tags || []).map((tag) => (
+                                <span
+                                  key={tag}
+                                  className="rounded-full bg-slate-100 px-2 py-0.5 text-slate-600"
+                                >
+                                  #{tag}
+                                </span>
+                              ))}
+                            </div>
+                          )}
 
                           {record.analysis_summary && (
                             <div className="bg-white border border-blue-100 rounded p-2 mb-2">
@@ -5773,6 +6407,11 @@ const Dashboard = () => {
                     </div>
                   </motion.div>
                 ))}
+                {records.length > 0 && filteredRecords.length === 0 && (
+                  <div className="rounded-xl border border-dashed border-gray-300 bg-gray-50 py-10 text-center text-gray-500">
+                    No records match the selected search and category filters.
+                  </div>
+                )}
               </div>
             )}
           </motion.div>
@@ -5973,6 +6612,94 @@ const Dashboard = () => {
         </AnimatePresence>
       </motion.main>
 
+      <AnimatePresence>
+        {showFullTimelineModal && user?.role === "patient" && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={() => setShowFullTimelineModal(false)}
+            className="fixed inset-0 z-[60] flex items-center justify-center bg-black/55 p-4 backdrop-blur-sm"
+          >
+            <motion.div
+              initial={{ scale: 0.96, opacity: 0, y: 15 }}
+              animate={{ scale: 1, opacity: 1, y: 0 }}
+              exit={{ scale: 0.96, opacity: 0, y: 15 }}
+              onClick={(event) => event.stopPropagation()}
+              className="max-h-[92vh] w-full max-w-6xl overflow-y-auto rounded-2xl bg-white shadow-2xl"
+            >
+              <div className="sticky top-0 z-10 flex items-center justify-between border-b bg-white px-6 py-4">
+                <div>
+                  <h2 className="text-lg font-bold text-gray-800">
+                    Complete Health Timeline
+                  </h2>
+                  <p className="text-sm text-gray-500">
+                    Review and filter your complete clinical history.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowFullTimelineModal(false)}
+                  className="flex h-10 w-10 items-center justify-center rounded-full bg-gray-100 text-gray-600 hover:bg-gray-200"
+                  aria-label="Close complete health timeline"
+                >
+                  <i className="fas fa-times"></i>
+                </button>
+              </div>
+              <div className="p-5">
+                <PatientHealthTimeline />
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+
+        {showFullClinicalSearchModal && user?.role === "patient" && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={() => setShowFullClinicalSearchModal(false)}
+            className="fixed inset-0 z-[60] flex items-center justify-center bg-black/55 p-4 backdrop-blur-sm"
+          >
+            <motion.div
+              initial={{ scale: 0.96, opacity: 0, y: 15 }}
+              animate={{ scale: 1, opacity: 1, y: 0 }}
+              exit={{ scale: 0.96, opacity: 0, y: 15 }}
+              onClick={(event) => event.stopPropagation()}
+              className="max-h-[92vh] w-full max-w-6xl overflow-y-auto rounded-2xl bg-gray-50 shadow-2xl"
+            >
+              <div className="sticky top-0 z-10 flex items-center justify-between border-b bg-white px-6 py-4">
+                <div>
+                  <h2 className="text-lg font-bold text-gray-800">
+                    Full Clinical Search
+                  </h2>
+                  <p className="text-sm text-gray-500">
+                    Use advanced filters across all of your clinical data.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowFullClinicalSearchModal(false)}
+                  className="flex h-10 w-10 items-center justify-center rounded-full bg-gray-100 text-gray-600 hover:bg-gray-200"
+                  aria-label="Close full clinical search"
+                >
+                  <i className="fas fa-times"></i>
+                </button>
+              </div>
+              <div className="p-5">
+                <ClinicalSearch
+                  user={user}
+                  onOpenRecord={(recordId) => {
+                    setShowFullClinicalSearchModal(false);
+                    loadRecordDetails(recordId);
+                  }}
+                />
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {user?.role === "patient" && currentView !== "meal-planner" && (
         <HealthChatbot user={user} />
       )}
@@ -5991,6 +6718,7 @@ const Dashboard = () => {
           patientEmail={clinicalProfileTarget.email}
           patientId={clinicalProfileTarget.id}
           canEdit={user?.role === "admin"}
+          canExport={clinicalProfileTarget.canExport !== false}
           onUpdated={loadAllPatients}
           onClose={() => setClinicalProfileTarget(null)}
         />

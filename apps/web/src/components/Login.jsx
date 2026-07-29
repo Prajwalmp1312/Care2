@@ -9,7 +9,7 @@ const PUBLIC_ROLES = ['patient', 'clinician'];
 const Login = ({ adminOnly = false }) => {
   const location = useLocation();
   const navigate = useNavigate();
-  const { user, login, register,  logout } = useAuth();
+  const { user, login, register, logout, completeExternalLogin } = useAuth();
   const isRegisterRoute = location.pathname === '/register';
   const preselectedRole = adminOnly
     ? 'admin'
@@ -623,17 +623,15 @@ const isClinicianProfessionalStepValid=
                     }
                   );
 
-                  // ✅ MANUALLY store token & user
-                  localStorage.setItem("access_token", res.data.access_token);
-                  localStorage.setItem("user", JSON.stringify(res.data.user));
-
                   if (!PUBLIC_ROLES.includes(res.data.user.role)) {
-                    localStorage.removeItem("access_token");
-                    localStorage.removeItem("user");
                     setError("Use the admin portal to sign in.");
                     return;
                   }
 
+                  completeExternalLogin(
+                    res.data.access_token,
+                    res.data.user,
+                  );
                   navigateToHome(res.data.user.role);
 
                   

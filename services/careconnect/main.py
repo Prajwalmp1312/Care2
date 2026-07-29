@@ -1,9 +1,11 @@
-from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Form, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel, EmailStr
-from typing import Optional, Dict, Any,List
-from datetime import datetime, timedelta
+from typing import Optional, Dict, Any, List, Set
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+import asyncio
 import bcrypt
 from jose import JWTError, jwt
 from dotenv import load_dotenv
@@ -11,6 +13,10 @@ load_dotenv()
 from google.oauth2 import id_token
 from google.auth.transport import requests
 import secrets
+import hashlib
+import csv
+import io
+from urllib.parse import urlparse, urlunparse
 # from email_service import send_reset_email, send_verification_code
 
 from document_text_extractor import extract_text_from_path
@@ -19,14 +25,14 @@ import traceback
 import uvicorn
 from sqlalchemy.orm import Session
 import os
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 import re
 from sqlalchemy import or_, text
 import fitz  # PyMuPDF for reading PDF text
 from models import MessageRequest as MessageRequestModel
 from database import SessionLocal
 from database import get_db, init_db, get_user_by_email_and_role, email_exists
-from models import Patient as PatientModel, Clinician as ClinicianModel, Admin as AdminModel, Appointment as AppointmentModel, Prescription as PrescriptionModel, Notification as NotificationModel, MedicalRecordVersion as RecordVersionModel, PatientProfileHistory as PatientProfileHistoryModel, EmergencyAlert as EmergencyAlertModel
+from models import Patient as PatientModel, Clinician as ClinicianModel, Admin as AdminModel, Appointment as AppointmentModel, Prescription as PrescriptionModel, Notification as NotificationModel, MedicalRecordVersion as RecordVersionModel, PatientProfileHistory as PatientProfileHistoryModel, EmergencyAlert as EmergencyAlertModel, EmergencyAlertEvent as EmergencyAlertEventModel, UserConsent as UserConsentModel, VideoConsultationEvent as VideoConsultationEventModel, UserSession as UserSessionModel, SecurityAuditEvent as SecurityAuditEventModel
 from models import Message as MessageModel, MedicalRecord as RecordModel
 import mimetypes
 from fastapi.responses import FileResponse
@@ -40,6 +46,22 @@ import logging
 from rag_service import index_record, retrieve_relevant_chunks, delete_record_chunks
 from nutrition_integration import build_nutrition_router
 from meal_planner import build_meal_planner_router, init_meal_planner_schema
+from clinical_organization import (
+    CATEGORY_BY_CODE,
+    RECORD_CATEGORIES,
+    normalize_category,
+    normalize_tags,
+    parse_iso_date,
+)
+from security_foundation import (
+    CHAT_UPLOAD_EXTENSIONS,
+    MEDICAL_UPLOAD_EXTENSIONS,
+    InMemoryRateLimiter,
+    RateLimitRule,
+    configured_upload_root,
+    read_validated_upload,
+    store_upload,
+)
 
 try:
     import google.generativeai as genai
@@ -80,17 +102,237 @@ def validate_password(password: str):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Password must contain a special character"
         )
+    if len(password.encode("utf-8")) > 72:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password is too long",
+        )
 
 # Configuration
 SECRET_KEY = os.getenv("SECRET_KEY", "your-super-secret-key-change-this")
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
+ENVIRONMENT = os.getenv("ENVIRONMENT", "development").strip().lower()
+JWT_ISSUER = os.getenv("JWT_ISSUER", "careconnect-api")
+JWT_AUDIENCE = os.getenv("JWT_AUDIENCE", "careconnect-web")
+REQUIRE_EMAIL_VERIFICATION = os.getenv("REQUIRE_EMAIL_VERIFICATION", "false").lower() == "true"
+TRUST_PROXY_HEADERS = os.getenv("TRUST_PROXY_HEADERS", "false").lower() == "true"
+MEDICAL_UPLOAD_MAX_BYTES = int(os.getenv("MEDICAL_UPLOAD_MAX_MB", "20")) * 1024 * 1024
+CHAT_UPLOAD_MAX_BYTES = int(os.getenv("CHAT_UPLOAD_MAX_MB", "10")) * 1024 * 1024
+UPLOAD_STORAGE_ROOT = configured_upload_root(__file__)
+APPOINTMENT_TIMEZONE_NAME = os.getenv(
+    "APPOINTMENT_TIMEZONE",
+    "America/Los_Angeles",
+).strip()
+try:
+    APPOINTMENT_TIMEZONE = ZoneInfo(APPOINTMENT_TIMEZONE_NAME)
+except ZoneInfoNotFoundError as exc:
+    if ENVIRONMENT == "production":
+        raise RuntimeError(
+            f"Invalid APPOINTMENT_TIMEZONE: {APPOINTMENT_TIMEZONE_NAME}"
+        ) from exc
+    logging.getLogger(__name__).warning(
+        "Unknown APPOINTMENT_TIMEZONE %s; falling back to UTC",
+        APPOINTMENT_TIMEZONE_NAME,
+    )
+    APPOINTMENT_TIMEZONE_NAME = "UTC"
+    APPOINTMENT_TIMEZONE = timezone.utc
+
+def _configured_comm360_url() -> str:
+    raw_url = os.getenv(
+        "COMM360_BASE_URL",
+        "https://comm360.feeltiptop.com/",
+    ).strip()
+    parsed = urlparse(raw_url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username
+        or parsed.password
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise RuntimeError(
+            "COMM360_BASE_URL must be an absolute root URL without credentials, "
+            "query parameters, or a fragment"
+        )
+    if ENVIRONMENT == "production" and parsed.scheme != "https":
+        raise RuntimeError("COMM360_BASE_URL must use HTTPS in production")
+    normalized_path = f"{parsed.path.rstrip('/')}/"
+    return urlunparse(
+        (parsed.scheme, parsed.netloc, normalized_path, "", "", "")
+    )
+
+
+COMM360_BASE_URL = _configured_comm360_url()
+CONSENT_DEFINITIONS = {
+    "video_consultation": {
+        "version": "2026-07",
+        "title": "Video consultation consent",
+        "disclosures": [
+            "Comm360 is an external meeting provider with its own terms and privacy practices.",
+            "CareConnect will not place medical details or patient identifiers in the launch URL.",
+            "Camera and microphone permissions are controlled in Comm360.",
+            "Video consultation is not an emergency service.",
+        ],
+    },
+    "emergency_alert": {
+        "version": "2026-07",
+        "title": "SOS alert consent",
+        "disclosures": [
+            "SOS notifies connected CareConnect clinicians and administrators; it does not automatically dispatch emergency services.",
+            "For an immediate or life-threatening emergency, contact local emergency services directly.",
+            "Response times can vary and the alert remains monitored until a staff owner resolves it.",
+        ],
+    },
+}
+
+if SECRET_KEY == "your-super-secret-key-change-this":
+    if ENVIRONMENT == "production":
+        raise RuntimeError("SECRET_KEY must be configured before starting in production")
+    logging.getLogger(__name__).warning(
+        "Development SECRET_KEY is in use. Configure a random SECRET_KEY before deployment."
+    )
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/auth/login")
 USE_GEMINI_HEALTH_TIPS = os.getenv("USE_GEMINI_HEALTH_TIPS", "false").lower() == "true"
 # Initialize FastAPI app
 app = FastAPI(title="CareConnect Pro API")
+rate_limiter = InMemoryRateLimiter()
+
+RATE_LIMIT_RULES = {
+    ("POST", "/api/auth/login"): RateLimitRule(10, 60),
+    ("POST", "/api/auth/google"): RateLimitRule(10, 60),
+    ("POST", "/api/auth/forgot-password"): RateLimitRule(5, 300),
+    ("POST", "/api/auth/reset-password"): RateLimitRule(10, 300),
+    ("POST", "/api/records/upload"): RateLimitRule(20, 60),
+    ("POST", "/api/chat/upload"): RateLimitRule(30, 60),
+    ("POST", "/api/emergency-alerts"): RateLimitRule(6, 60),
+}
+
+AUDITED_READ_PREFIXES = (
+    "/api/records",
+    "/api/patients",
+    "/api/profile",
+    "/api/prescriptions",
+    "/api/clinical/search",
+    "/api/chat/download",
+    "/api/exports",
+)
+
+
+def _request_ip(request: Request) -> str:
+    if TRUST_PROXY_HEADERS:
+        forwarded = request.headers.get("x-forwarded-for", "")
+        if forwarded:
+            return forwarded.split(",", 1)[0].strip()[:64]
+    return (request.client.host if request.client else "unknown")[:64]
+
+
+def _audit_actor_from_request(request: Request) -> tuple[Optional[str], Optional[str]]:
+    authorization = request.headers.get("authorization", "")
+    if not authorization.lower().startswith("bearer "):
+        return None, None
+    try:
+        payload = jwt.decode(
+            authorization.split(" ", 1)[1],
+            SECRET_KEY,
+            algorithms=[ALGORITHM],
+            audience=JWT_AUDIENCE,
+            issuer=JWT_ISSUER,
+        )
+        return payload.get("sub"), payload.get("role")
+    except JWTError:
+        return None, None
+
+
+@app.middleware("http")
+async def security_foundation_middleware(request: Request, call_next):
+    """Rate-limit sensitive routes, attach hardening headers, and audit access."""
+
+    request_id = request.headers.get("x-request-id") or secrets.token_hex(16)
+    request.state.request_id = request_id
+    client_ip = _request_ip(request)
+    specific_rule = RATE_LIMIT_RULES.get((request.method.upper(), request.url.path))
+    rule = specific_rule
+    if not rule and request.url.path.startswith("/api/"):
+        rule = RateLimitRule(240, 60)
+
+    if rule:
+        rate_scope = request.url.path if specific_rule else "api-global"
+        allowed, retry_after = rate_limiter.check(
+            f"{client_ip}:{request.method.upper()}:{rate_scope}",
+            rule,
+        )
+        if not allowed:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Too many requests. Please try again shortly."},
+                headers={"Retry-After": str(retry_after), "X-Request-ID": request_id},
+            )
+
+    response = None
+    unexpected_error = None
+    try:
+        response = await call_next(request)
+        return response
+    except Exception as exc:
+        unexpected_error = exc
+        raise
+    finally:
+        status_code = response.status_code if response is not None else 500
+        if response is not None:
+            response.headers["X-Request-ID"] = request_id
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["X-Frame-Options"] = "DENY"
+            response.headers["Referrer-Policy"] = "no-referrer"
+            response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+            if request.url.path.startswith("/api/"):
+                response.headers["Cache-Control"] = "no-store"
+            if request.url.scheme == "https":
+                response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+
+        should_audit = (
+            request.url.path.startswith("/api/")
+            and (
+                request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}
+                or any(request.url.path.startswith(prefix) for prefix in AUDITED_READ_PREFIXES)
+            )
+        )
+        if should_audit:
+            actor_email, actor_role = _audit_actor_from_request(request)
+            try:
+                audit_db = SessionLocal()
+                audit_db.add(
+                    SecurityAuditEventModel(
+                        request_id=request_id,
+                        actor_email=actor_email,
+                        actor_role=actor_role,
+                        action=f"{request.method.upper()} {request.url.path}"[:120],
+                        resource_type=(
+                            request.url.path.strip("/").split("/")[1]
+                            if len(request.url.path.strip("/").split("/")) > 1
+                            else "api"
+                        )[:80],
+                        resource_id=request.url.path[:120],
+                        outcome="success" if status_code < 400 else "denied" if status_code in {401, 403} else "failure",
+                        ip_address=client_ip,
+                        details=json.dumps(
+                            {
+                                "status_code": status_code,
+                                "unexpected_error": type(unexpected_error).__name__ if unexpected_error else None,
+                            }
+                        ),
+                    )
+                )
+                audit_db.commit()
+            except Exception:
+                logging.getLogger(__name__).exception("Failed to write security audit event")
+            finally:
+                if "audit_db" in locals():
+                    audit_db.close()
 
 medical_analyzer = MedicalRecordAnalyzer()
 
@@ -128,12 +370,46 @@ app.add_middleware(
     max_age=3600,
 )
 
-# Initialize database on startup
+# Initialize the database and the in-process escalation monitor on startup.
+emergency_monitor_task = None
+
+
+async def emergency_monitor_loop():
+    while True:
+        await asyncio.sleep(15)
+        monitor_db = SessionLocal()
+        try:
+            _apply_due_emergency_escalations(monitor_db)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            monitor_db.rollback()
+            logging.getLogger(__name__).exception(
+                "Emergency escalation monitor failed"
+            )
+        finally:
+            monitor_db.close()
+
+
 @app.on_event("startup")
-def startup_event():
+async def startup_event():
+    global emergency_monitor_task
     init_db()
     ensure_prescription_multi_medicine_column()
     init_meal_planner_schema()
+    emergency_monitor_task = asyncio.create_task(emergency_monitor_loop())
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global emergency_monitor_task
+    if emergency_monitor_task:
+        emergency_monitor_task.cancel()
+        try:
+            await emergency_monitor_task
+        except asyncio.CancelledError:
+            pass
+        emergency_monitor_task = None
 
 # Pydantic Models
 class UserRegister(BaseModel):
@@ -165,6 +441,8 @@ class Token(BaseModel):
     access_token: str
     token_type: str
     user: dict
+    expires_at: Optional[str] = None
+    session_id: Optional[int] = None
 
 class RegisterResponse(BaseModel):
     message: str
@@ -185,6 +463,11 @@ class AppointmentCreate(BaseModel):
 class AppointmentStatusUpdate(BaseModel):
     status: str
     notes: Optional[str] = None
+
+
+class AppointmentNotesUpdate(BaseModel):
+    notes: str
+
 
 class ClinicianAvailabilityUpdate(BaseModel):
     consultation_hours: Dict[str, List[Dict[str, str]]]
@@ -252,6 +535,19 @@ class EmergencyAlertCreate(BaseModel):
 class EmergencyAlertStatusUpdate(BaseModel):
     status: str
 
+
+class ConsentAcceptRequest(BaseModel):
+    accepted: bool
+    consent_version: Optional[str] = None
+
+
+class EmergencyAlertNoteRequest(BaseModel):
+    notes: str
+
+
+class EmergencyAlertEscalationRequest(BaseModel):
+    reason: str
+
 # Helper Functions
 def _password_bytes(password: str) -> bytes:
     # bcrypt only uses the first 72 bytes. passlib truncated silently,
@@ -271,34 +567,161 @@ def verify_password(plain_password, hashed_password):
 def get_password_hash(password):
     return bcrypt.hashpw(_password_bytes(password), bcrypt.gensalt()).decode("utf-8")
 
-def create_access_token(data: dict):
+def create_access_token(data: dict, *, jti: str, expires_at: datetime):
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
+    now = datetime.utcnow()
+    to_encode.update(
+        {
+            "exp": expires_at,
+            "iat": now,
+            "nbf": now,
+            "jti": jti,
+            "iss": JWT_ISSUER,
+            "aud": JWT_AUDIENCE,
+        }
+    )
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def create_user_session_token(user, db: Session, request: Request) -> tuple[str, UserSessionModel]:
+    expires_at = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    jti = secrets.token_urlsafe(32)
+    now = datetime.utcnow()
+
+    # Keep the active-session set bounded per account. Expired rows remain as
+    # audit history; the oldest live session is revoked when the cap is reached.
+    active_sessions = db.query(UserSessionModel).filter(
+        UserSessionModel.user_email == user.email,
+        UserSessionModel.user_role == user.role,
+        UserSessionModel.revoked_at.is_(None),
+        UserSessionModel.expires_at > now,
+    ).order_by(UserSessionModel.last_seen_at.asc()).all()
+    for stale_session in active_sessions[: max(0, len(active_sessions) - 9)]:
+        stale_session.revoked_at = now
+        stale_session.revoke_reason = "session_limit"
+
+    session = UserSessionModel(
+        jti=jti,
+        user_email=user.email,
+        user_role=user.role,
+        user_agent=(request.headers.get("user-agent") or "Unknown device")[:500],
+        ip_address=_request_ip(request),
+        expires_at=expires_at,
+        last_seen_at=now,
+    )
+    db.add(session)
+    db.commit()
+    db.refresh(session)
+    token = create_access_token(
+        {"sub": user.email, "role": user.role, "sid": session.id},
+        jti=jti,
+        expires_at=expires_at,
+    )
+    return token, session
+
+
+def revoke_all_user_sessions(
+    db: Session,
+    *,
+    user_email: str,
+    user_role: str,
+    reason: str,
+) -> int:
+    return db.query(UserSessionModel).filter(
+        UserSessionModel.user_email == user_email,
+        UserSessionModel.user_role == user_role,
+        UserSessionModel.revoked_at.is_(None),
+    ).update(
+        {
+            UserSessionModel.revoked_at: datetime.utcnow(),
+            UserSessionModel.revoke_reason: reason[:255],
+        },
+        synchronize_session=False,
+    )
 
 # def generate_verification_code() -> str:
 #     return f"{secrets.randbelow(1000000):06d}"
 
-async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+async def get_current_user(
+    request: Request,
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db),
+):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        payload = jwt.decode(
+            token,
+            SECRET_KEY,
+            algorithms=[ALGORITHM],
+            audience=JWT_AUDIENCE,
+            issuer=JWT_ISSUER,
+        )
         email: str = payload.get("sub")
         role: str = payload.get("role")
-        if email is None or role is None:
+        jti: str = payload.get("jti")
+        if email is None or role is None or jti is None:
             raise credentials_exception
     except JWTError:
         raise credentials_exception
-    
-    user = get_user_by_email_and_role(db, email, role)
-    if user is None:
+
+    session = db.query(UserSessionModel).filter(
+        UserSessionModel.jti == jti,
+        UserSessionModel.user_email == email,
+        UserSessionModel.user_role == role,
+    ).first()
+    now = datetime.utcnow()
+    if (
+        session is None
+        or session.revoked_at is not None
+        or session.expires_at <= now
+    ):
         raise credentials_exception
+
+    user = get_user_by_email_and_role(db, email, role)
+    if user is None or not getattr(user, "is_active", True):
+        raise credentials_exception
+    if REQUIRE_EMAIL_VERIFICATION and not getattr(user, "email_verified", False):
+        raise HTTPException(status_code=403, detail="Email verification is required")
+    if role == "clinician" and getattr(user, "approval_status", None) != "approved":
+        raise HTTPException(status_code=403, detail="Clinician account is not approved")
+
+    if not session.last_seen_at or session.last_seen_at < now - timedelta(minutes=5):
+        session.last_seen_at = now
+        db.commit()
+
+    request.state.session_jti = jti
+    request.state.session_id = session.id
+    request.state.current_user_email = email
+    request.state.current_user_role = role
     return user
+
+
+def connected_patient_emails(db: Session, clinician_email: str) -> Set[str]:
+    rows = db.query(MessageRequestModel.patient_email).filter(
+        MessageRequestModel.clinician_email == clinician_email,
+        MessageRequestModel.status == "accepted",
+    ).all()
+    return {row[0] for row in rows}
+
+
+def accessible_patient_emails(db: Session, current_user) -> Optional[Set[str]]:
+    if current_user.role == "patient":
+        return {current_user.email}
+    if current_user.role == "clinician":
+        return connected_patient_emails(db, current_user.email)
+    if current_user.role == "admin":
+        return None
+    return set()
+
+
+def require_patient_access(db: Session, current_user, patient_email: str) -> None:
+    allowed = accessible_patient_emails(db, current_user)
+    if allowed is not None and patient_email not in allowed:
+        raise HTTPException(status_code=403, detail="You do not have access to this patient")
 
 
 app.include_router(build_nutrition_router(get_current_user))
@@ -330,6 +753,153 @@ def create_notification(
 
     return notification
 
+
+def _active_consent(
+    db: Session,
+    *,
+    user_email: str,
+    consent_type: str,
+) -> Optional[UserConsentModel]:
+    definition = CONSENT_DEFINITIONS.get(consent_type)
+    if not definition:
+        return None
+    return db.query(UserConsentModel).filter(
+        UserConsentModel.user_email == user_email,
+        UserConsentModel.consent_type == consent_type,
+        UserConsentModel.status == "accepted",
+        UserConsentModel.consent_version == definition["version"],
+        UserConsentModel.revoked_at.is_(None),
+    ).first()
+
+
+def _consent_response(
+    db: Session,
+    *,
+    current_user,
+    consent_type: str,
+) -> dict:
+    definition = CONSENT_DEFINITIONS.get(consent_type)
+    if not definition:
+        raise HTTPException(status_code=404, detail="Consent type not found")
+    consent = _active_consent(
+        db,
+        user_email=current_user.email,
+        consent_type=consent_type,
+    )
+    return {
+        "consent_type": consent_type,
+        "title": definition["title"],
+        "version": definition["version"],
+        "disclosures": definition["disclosures"],
+        "accepted": bool(consent),
+        "accepted_at": (
+            consent.accepted_at.isoformat() if consent and consent.accepted_at else None
+        ),
+    }
+
+
+@app.get("/api/consents/{consent_type}")
+async def get_consent_status(
+    consent_type: str,
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if consent_type == "emergency_alert" and current_user.role != "patient":
+        raise HTTPException(
+            status_code=403,
+            detail="SOS consent is available only to patients",
+        )
+    if consent_type == "video_consultation" and current_user.role not in [
+        "patient",
+        "clinician",
+    ]:
+        raise HTTPException(
+            status_code=403,
+            detail="Video consent is available to consultation participants",
+        )
+    return _consent_response(
+        db,
+        current_user=current_user,
+        consent_type=consent_type,
+    )
+
+
+@app.post("/api/consents/{consent_type}")
+async def accept_consent(
+    consent_type: str,
+    consent_data: ConsentAcceptRequest,
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    definition = CONSENT_DEFINITIONS.get(consent_type)
+    if not definition:
+        raise HTTPException(status_code=404, detail="Consent type not found")
+    if not consent_data.accepted:
+        raise HTTPException(
+            status_code=400,
+            detail="Consent must be explicitly accepted",
+        )
+    if consent_data.consent_version not in [None, definition["version"]]:
+        raise HTTPException(
+            status_code=409,
+            detail="The consent disclosure has changed. Review the current version.",
+        )
+    if consent_type == "emergency_alert" and current_user.role != "patient":
+        raise HTTPException(status_code=403, detail="Only patients can accept SOS consent")
+    if consent_type == "video_consultation" and current_user.role not in [
+        "patient",
+        "clinician",
+    ]:
+        raise HTTPException(status_code=403, detail="Not a consultation participant")
+
+    now = datetime.utcnow()
+    consent = db.query(UserConsentModel).filter(
+        UserConsentModel.user_email == current_user.email,
+        UserConsentModel.consent_type == consent_type,
+    ).first()
+    if consent:
+        consent.user_role = current_user.role
+        consent.consent_version = definition["version"]
+        consent.status = "accepted"
+        consent.accepted_at = now
+        consent.revoked_at = None
+        consent.updated_at = now
+    else:
+        consent = UserConsentModel(
+            user_email=current_user.email,
+            user_role=current_user.role,
+            consent_type=consent_type,
+            consent_version=definition["version"],
+            status="accepted",
+            accepted_at=now,
+        )
+        db.add(consent)
+    db.commit()
+    return _consent_response(
+        db,
+        current_user=current_user,
+        consent_type=consent_type,
+    )
+
+
+@app.delete("/api/consents/{consent_type}")
+async def revoke_consent(
+    consent_type: str,
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    consent = db.query(UserConsentModel).filter(
+        UserConsentModel.user_email == current_user.email,
+        UserConsentModel.consent_type == consent_type,
+        UserConsentModel.status == "accepted",
+    ).first()
+    if not consent:
+        return {"message": "No active consent was found"}
+    consent.status = "revoked"
+    consent.revoked_at = datetime.utcnow()
+    db.commit()
+    return {"message": "Consent revoked", "consent_type": consent_type}
+
 def get_connected_clinician_emails_for_patient(db: Session, patient_email: str):
     connections = db.query(MessageRequestModel).filter(
         MessageRequestModel.patient_email == patient_email,
@@ -346,6 +916,16 @@ def get_connected_clinician_emails_for_patient(db: Session, patient_email: str):
 
 
 def notify_emergency_alert_receivers(db: Session, alert: EmergencyAlertModel):
+    # Confirm the SOS in the patient's dashboard notification stream. Patients
+    # do not need the staff-facing emergency alert management screen.
+    create_notification(
+        db=db,
+        user_email=alert.patient_email,
+        title="SOS sent",
+        message="Your SOS was sent to your connected care team and administrators.",
+        notification_type="emergency"
+    )
+
     # Notify connected clinicians
     clinician_emails = get_connected_clinician_emails_for_patient(
         db=db,
@@ -844,14 +1424,21 @@ def build_patient_health_timeline(
             "status": "completed",
             "icon": "fa-file-medical",
             "color": "blue",
-            "date": _timeline_datetime_to_iso(record.uploaded_at),
+            "date": (
+                f"{record.source_date}T00:00:00"
+                if getattr(record, "source_date", None)
+                else _timeline_datetime_to_iso(record.uploaded_at)
+            ),
             "metadata": {
                 "record_id": record.id,
                 "record_type": record.type,
                 "record_category": record.category,
+                "category_code": getattr(record, "category_code", "other") or "other",
+                "tags": _safe_json_loads(getattr(record, "tags", None), []),
+                "source_date": getattr(record, "source_date", None),
                 "has_ai_summary": bool(record.analysis_summary),
                 "has_metrics": bool(record.metrics_data),
-                "findings_count": len(json.loads(record.key_findings)) if record.key_findings else 0
+                "findings_count": len(_safe_json_loads(record.key_findings, []))
             }
         })
 
@@ -1104,25 +1691,25 @@ async def upload_chat_file(
     if not connection:
         raise HTTPException(status_code=403, detail="No active conversation with this user")
     
-    # Create uploads folder
-    folder = f"chat_uploads/{current_user.email}"
-    os.makedirs(folder, exist_ok=True)
-    
-    # Save file
-    file_extension = os.path.splitext(file.filename)[1]
-    unique_filename = f"{datetime.utcnow().timestamp()}_{file.filename}"
-    file_path = f"{folder}/{unique_filename}"
-    
-    with open(file_path, "wb") as f:
-        content = await file.read()
-        f.write(content)
+    original_name, extension, mime_type, content = await read_validated_upload(
+        file,
+        allowed_extensions=CHAT_UPLOAD_EXTENSIONS,
+        max_bytes=CHAT_UPLOAD_MAX_BYTES,
+    )
+    file_path = store_upload(
+        content=content,
+        storage_root=UPLOAD_STORAGE_ROOT,
+        purpose="chat",
+        owner_key=current_user.email,
+        extension=extension,
+    )
     
     # Determine file type
     file_type = "document"
-    if file.content_type:
-        if file.content_type.startswith("image/"):
+    if mime_type:
+        if mime_type.startswith("image/"):
             file_type = "image"
-        elif file.content_type == "application/pdf":
+        elif mime_type == "application/pdf":
             file_type = "pdf"
     
     # Save to database
@@ -1131,8 +1718,8 @@ async def upload_chat_file(
     attachment = ChatAttachmentModel(
         sender_email=current_user.email,
         recipient_email=recipient_email,
-        file_name=file.filename,
-        file_path=file_path,
+        file_name=original_name,
+        file_path=str(file_path),
         file_type=file_type,
         file_size=len(content)
     )
@@ -1188,27 +1775,10 @@ def get_health_status():
 @app.get("/api/chat/download/{attachment_id}")
 async def download_attachment(
     attachment_id: int,
-    token: Optional[str] = None,  # Accept token as query parameter
+    current_user=Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     from models import ChatAttachment as ChatAttachmentModel
-    
-    # Get current user from token
-    if not token:
-        raise HTTPException(status_code=401, detail="No token provided")
-    
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        email: str = payload.get("sub")
-        role: str = payload.get("role")
-        if email is None or role is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    
-    current_user = get_user_by_email_and_role(db, email, role)
-    if not current_user:
-        raise HTTPException(status_code=401, detail="User not found")
     
     attachment = db.query(ChatAttachmentModel).filter(
         ChatAttachmentModel.id == attachment_id
@@ -1508,6 +2078,13 @@ async def toggle_clinician_status(
 
     # toggle active
     clinician.is_active = not clinician.is_active
+    if not clinician.is_active:
+        revoke_all_user_sessions(
+            db,
+            user_email=clinician.email,
+            user_role="clinician",
+            reason="account_deactivated",
+        )
 
     # ✅ AUTO-APPROVE when activating
     if clinician.is_active and clinician.approval_status != "approved":
@@ -1563,6 +2140,50 @@ async def get_audit_logs(
                 "timestamp": log.timestamp.isoformat() if log.timestamp else None
             }
             for log in logs
+        ]
+    }
+
+
+@app.get("/api/admin/security-audit")
+async def get_security_audit_events(
+    actor_email: Optional[str] = Query(None, max_length=100),
+    action: Optional[str] = Query(None, max_length=100),
+    outcome: Optional[str] = Query(None, max_length=20),
+    limit: int = Query(100, ge=1, le=500),
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    query = db.query(SecurityAuditEventModel)
+    if actor_email:
+        query = query.filter(SecurityAuditEventModel.actor_email == actor_email)
+    if action:
+        query = query.filter(SecurityAuditEventModel.action.ilike(f"%{action.strip()}%"))
+    if outcome:
+        if outcome not in {"success", "denied", "failure"}:
+            raise HTTPException(status_code=400, detail="Invalid audit outcome")
+        query = query.filter(SecurityAuditEventModel.outcome == outcome)
+
+    events = query.order_by(SecurityAuditEventModel.created_at.desc()).limit(limit).all()
+    return {
+        "events": [
+            {
+                "id": event.id,
+                "request_id": event.request_id,
+                "actor_email": event.actor_email,
+                "actor_role": event.actor_role,
+                "action": event.action,
+                "resource_type": event.resource_type,
+                "resource_id": event.resource_id,
+                "patient_email": event.patient_email,
+                "outcome": event.outcome,
+                "ip_address": event.ip_address,
+                "details": _safe_json_loads(event.details, {}),
+                "created_at": event.created_at.isoformat() if event.created_at else None,
+            }
+            for event in events
         ]
     }
     
@@ -1670,6 +2291,12 @@ async def admin_delete_user(
     target_name = target_user.name
 
     target_user.is_active = False
+    revoke_all_user_sessions(
+        db,
+        user_email=target_email,
+        user_role=role,
+        reason="account_deactivated",
+    )
 
     audit_log = AuditLogModel(
         admin_email=current_user.email,
@@ -1851,6 +2478,10 @@ async def get_admin_dashboard_stats(
     active_conversations = db.query(MessageRequestModel).filter(
         MessageRequestModel.status == "accepted"
     ).count()
+    active_sessions = db.query(UserSessionModel).filter(
+        UserSessionModel.revoked_at.is_(None),
+        UserSessionModel.expires_at > datetime.utcnow(),
+    ).count()
     
     return {
         "total_users": total_patients + total_clinicians + total_admins,
@@ -1862,7 +2493,295 @@ async def get_admin_dashboard_stats(
         "pending_join_requests": pending_requests,
         "total_messages": total_messages,
         "total_records": total_records,
-        "active_conversations": active_conversations
+        "active_conversations": active_conversations,
+        "active_sessions": active_sessions,
+    }
+
+
+@app.get("/api/dashboard/widgets")
+async def get_role_dashboard_widgets(
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return a compact, actionable queue tailored to the signed-in role."""
+    today = datetime.utcnow().date().isoformat()
+    thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+
+    if current_user.role == "patient":
+        upcoming = db.query(AppointmentModel).filter(
+            AppointmentModel.patient_email == current_user.email,
+            AppointmentModel.appointment_date >= today,
+            AppointmentModel.status.in_(["pending", "approved"]),
+        ).order_by(
+            AppointmentModel.appointment_date.asc(),
+            AppointmentModel.appointment_time.asc(),
+        ).all()
+        active_prescriptions = db.query(PrescriptionModel).filter(
+            PrescriptionModel.patient_email == current_user.email,
+            PrescriptionModel.status == "active",
+        ).count()
+        unread_messages = db.query(MessageModel).filter(
+            MessageModel.recipient_email == current_user.email,
+            MessageModel.read.is_(False),
+        ).count()
+        recent_records = db.query(RecordModel).filter(
+            RecordModel.patient_email == current_user.email,
+            RecordModel.uploaded_at >= thirty_days_ago,
+        ).count()
+        next_appointment = upcoming[0] if upcoming else None
+        return {
+            "title": "Your care at a glance",
+            "cards": [
+                {
+                    "label": "Upcoming visits",
+                    "value": len(upcoming),
+                    "hint": (
+                        f"Next: {next_appointment.appointment_date} at "
+                        f"{next_appointment.appointment_time}"
+                        if next_appointment
+                        else "No visit currently scheduled"
+                    ),
+                    "icon": "fa-calendar-check",
+                    "tone": "blue",
+                },
+                {
+                    "label": "Active prescriptions",
+                    "value": active_prescriptions,
+                    "hint": "Current medication plans",
+                    "icon": "fa-prescription-bottle-medical",
+                    "tone": "emerald",
+                },
+                {
+                    "label": "Unread care messages",
+                    "value": unread_messages,
+                    "hint": "Messages awaiting review",
+                    "icon": "fa-envelope",
+                    "tone": "violet",
+                },
+                {
+                    "label": "New records",
+                    "value": recent_records,
+                    "hint": "Uploaded in the last 30 days",
+                    "icon": "fa-file-medical",
+                    "tone": "amber",
+                },
+            ],
+        }
+
+    if current_user.role == "clinician":
+        connected = connected_patient_emails(db, current_user.email)
+        today_appointments = db.query(AppointmentModel).filter(
+            AppointmentModel.clinician_email == current_user.email,
+            AppointmentModel.appointment_date == today,
+            AppointmentModel.status.in_(["pending", "approved"]),
+        ).count()
+        pending_appointments = db.query(AppointmentModel).filter(
+            AppointmentModel.clinician_email == current_user.email,
+            AppointmentModel.status == "pending",
+        ).count()
+        unread_messages = db.query(MessageModel).filter(
+            MessageModel.recipient_email == current_user.email,
+            MessageModel.read.is_(False),
+        ).count()
+        critical_patients = (
+            db.query(PatientModel).filter(
+                PatientModel.email.in_(connected),
+                PatientModel.status == "critical",
+            ).count()
+            if connected
+            else 0
+        )
+        return {
+            "title": "Clinical work queue",
+            "cards": [
+                {
+                    "label": "Today's consultations",
+                    "value": today_appointments,
+                    "hint": "Pending and approved appointments",
+                    "icon": "fa-calendar-day",
+                    "tone": "blue",
+                },
+                {
+                    "label": "Pending approvals",
+                    "value": pending_appointments,
+                    "hint": "Appointment requests to review",
+                    "icon": "fa-clock",
+                    "tone": "amber",
+                },
+                {
+                    "label": "Unread patient messages",
+                    "value": unread_messages,
+                    "hint": "Messages awaiting a response",
+                    "icon": "fa-comments",
+                    "tone": "violet",
+                },
+                {
+                    "label": "Critical connected patients",
+                    "value": critical_patients,
+                    "hint": f"Across {len(connected)} connected patients",
+                    "icon": "fa-triangle-exclamation",
+                    "tone": "rose",
+                },
+            ],
+        }
+
+    if current_user.role == "admin":
+        from models import ClinicianJoinRequest as JoinRequestModel
+
+        active_alerts = db.query(EmergencyAlertModel).filter(
+            EmergencyAlertModel.status.in_(["active", "acknowledged"]),
+        ).count()
+        active_sessions = db.query(UserSessionModel).filter(
+            UserSessionModel.revoked_at.is_(None),
+            UserSessionModel.expires_at > datetime.utcnow(),
+        ).count()
+        pending_requests = db.query(JoinRequestModel).filter(
+            JoinRequestModel.status == "pending",
+        ).count()
+        recent_records = db.query(RecordModel).filter(
+            RecordModel.uploaded_at >= thirty_days_ago,
+        ).count()
+        return {
+            "title": "Operations watchlist",
+            "cards": [
+                {
+                    "label": "Open SOS alerts",
+                    "value": active_alerts,
+                    "hint": "Active or acknowledged",
+                    "icon": "fa-triangle-exclamation",
+                    "tone": "rose",
+                },
+                {
+                    "label": "Active sessions",
+                    "value": active_sessions,
+                    "hint": "Currently valid user sessions",
+                    "icon": "fa-shield-halved",
+                    "tone": "blue",
+                },
+                {
+                    "label": "Clinician approvals",
+                    "value": pending_requests,
+                    "hint": "Join requests awaiting review",
+                    "icon": "fa-user-check",
+                    "tone": "amber",
+                },
+                {
+                    "label": "Records added",
+                    "value": recent_records,
+                    "hint": "Across the last 30 days",
+                    "icon": "fa-file-circle-plus",
+                    "tone": "emerald",
+                },
+            ],
+        }
+
+    raise HTTPException(status_code=403, detail="Unsupported dashboard role")
+
+
+@app.get("/api/admin/analytics")
+async def get_admin_analytics(
+    range_days: int = Query(30, ge=7, le=365),
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Server-calculated operational and clinical analytics for administrators."""
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    start = datetime.utcnow() - timedelta(days=range_days - 1)
+    bucket_size = 1 if range_days <= 31 else 7 if range_days <= 180 else 30
+    bucket_count = (range_days + bucket_size - 1) // bucket_size
+    trends = []
+    for index in range(bucket_count):
+        bucket_date = (start + timedelta(days=index * bucket_size)).date()
+        trends.append(
+            {
+                "label": bucket_date.strftime("%b %d"),
+                "registrations": 0,
+                "records": 0,
+                "messages": 0,
+                "appointments": 0,
+                "prescriptions": 0,
+            }
+        )
+
+    def add_to_trend(rows, date_getter, key):
+        for row in rows:
+            value = date_getter(row)
+            if not value or value < start:
+                continue
+            index = min(
+                max((value.date() - start.date()).days // bucket_size, 0),
+                bucket_count - 1,
+            )
+            trends[index][key] += 1
+
+    new_patients = db.query(PatientModel).filter(
+        PatientModel.created_at >= start
+    ).all()
+    new_clinicians = db.query(ClinicianModel).filter(
+        ClinicianModel.created_at >= start
+    ).all()
+    records = db.query(RecordModel).filter(RecordModel.uploaded_at >= start).all()
+    messages = db.query(MessageModel).filter(MessageModel.sent_at >= start).all()
+    appointments = db.query(AppointmentModel).filter(
+        AppointmentModel.created_at >= start
+    ).all()
+    prescriptions = db.query(PrescriptionModel).filter(
+        PrescriptionModel.created_at >= start
+    ).all()
+    alerts = db.query(EmergencyAlertModel).filter(
+        EmergencyAlertModel.created_at >= start
+    ).all()
+
+    add_to_trend(new_patients, lambda item: item.created_at, "registrations")
+    add_to_trend(new_clinicians, lambda item: item.created_at, "registrations")
+    add_to_trend(records, lambda item: item.uploaded_at, "records")
+    add_to_trend(messages, lambda item: item.sent_at, "messages")
+    add_to_trend(appointments, lambda item: item.created_at, "appointments")
+    add_to_trend(prescriptions, lambda item: item.created_at, "prescriptions")
+
+    patient_status = {"stable": 0, "attention": 0, "critical": 0}
+    for patient in db.query(PatientModel).all():
+        status_value = patient.status or "stable"
+        patient_status[status_value] = patient_status.get(status_value, 0) + 1
+
+    completed_appointments = sum(
+        1 for item in appointments if item.status == "completed"
+    )
+    actionable_alerts = sum(
+        1 for item in alerts if item.status in ["active", "acknowledged"]
+    )
+    unread_messages = db.query(MessageModel).filter(
+        MessageModel.read.is_(False)
+    ).count()
+    active_connections = db.query(MessageRequestModel).filter(
+        MessageRequestModel.status == "accepted"
+    ).count()
+
+    return {
+        "range_days": range_days,
+        "generated_at": datetime.utcnow().isoformat(),
+        "totals": {
+            "new_users": len(new_patients) + len(new_clinicians),
+            "records": len(records),
+            "messages": len(messages),
+            "appointments": len(appointments),
+            "prescriptions": len(prescriptions),
+            "emergency_alerts": len(alerts),
+        },
+        "operations": {
+            "unread_messages": unread_messages,
+            "active_connections": active_connections,
+            "appointment_completion_rate": (
+                round(completed_appointments / len(appointments) * 100, 1)
+                if appointments
+                else 0
+            ),
+            "actionable_alerts": actionable_alerts,
+        },
+        "patient_status": patient_status,
+        "trends": trends,
     }
 
 WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
@@ -2882,6 +3801,35 @@ async def get_appointments(
             ClinicianModel.email == appointment.clinician_email
         ).first()
 
+        launch_opens_at = None
+        launch_closes_at = None
+        launch_available = False
+        if appointment.appointment_type == "video_call":
+            try:
+                scheduled_at = datetime.strptime(
+                    f"{appointment.appointment_date} {appointment.appointment_time}",
+                    "%Y-%m-%d %H:%M",
+                ).replace(tzinfo=APPOINTMENT_TIMEZONE)
+                duration_minutes = (
+                    getattr(clinician, "consultation_duration_minutes", 15) or 15
+                    if clinician
+                    else 15
+                )
+                launch_opens = scheduled_at - timedelta(minutes=15)
+                launch_closes = scheduled_at + timedelta(
+                    minutes=duration_minutes + 30
+                )
+                launch_opens_at = launch_opens.isoformat()
+                launch_closes_at = launch_closes.isoformat()
+                launch_available = (
+                    appointment.status == "approved"
+                    and launch_opens
+                    <= datetime.now(APPOINTMENT_TIMEZONE)
+                    <= launch_closes
+                )
+            except ValueError:
+                pass
+
         result.append({
             "id": appointment.id,
             "patient_email": appointment.patient_email,
@@ -2900,10 +3848,118 @@ async def get_appointments(
             "status": appointment.status,
             "notes": appointment.notes,
             "created_at": appointment.created_at.isoformat() if appointment.created_at else None,
-            "updated_at": appointment.updated_at.isoformat() if appointment.updated_at else None
+            "updated_at": appointment.updated_at.isoformat() if appointment.updated_at else None,
+            "video_launch_opens_at": launch_opens_at,
+            "video_launch_closes_at": launch_closes_at,
+            "video_launch_available": launch_available,
         })
 
     return {"appointments": result}
+
+
+@app.post("/api/video-consultations/appointments/{appointment_id}/launch")
+async def launch_video_consultation(
+    appointment_id: int,
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    appointment = db.query(AppointmentModel).filter(
+        AppointmentModel.id == appointment_id
+    ).first()
+    if not appointment:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+    if current_user.role not in ["patient", "clinician"]:
+        raise HTTPException(
+            status_code=403,
+            detail="Only consultation participants can launch a video visit",
+        )
+    participant_email = (
+        appointment.patient_email
+        if current_user.role == "patient"
+        else appointment.clinician_email
+    )
+    if participant_email != current_user.email:
+        raise HTTPException(
+            status_code=403,
+            detail="You are not a participant in this appointment",
+        )
+    if appointment.appointment_type != "video_call":
+        raise HTTPException(
+            status_code=400,
+            detail="This appointment is not configured for video consultation",
+        )
+    if appointment.status != "approved":
+        raise HTTPException(
+            status_code=409,
+            detail="The video consultation must be approved before launch",
+        )
+    if not _active_consent(
+        db,
+        user_email=current_user.email,
+        consent_type="video_consultation",
+    ):
+        raise HTTPException(
+            status_code=428,
+            detail="Video consultation consent is required before launch",
+        )
+
+    try:
+        scheduled_at = datetime.strptime(
+            f"{appointment.appointment_date} {appointment.appointment_time}",
+            "%Y-%m-%d %H:%M",
+        ).replace(tzinfo=APPOINTMENT_TIMEZONE)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Appointment time is not valid",
+        ) from exc
+    clinician = db.query(ClinicianModel).filter(
+        ClinicianModel.email == appointment.clinician_email
+    ).first()
+    duration_minutes = (
+        getattr(clinician, "consultation_duration_minutes", 15) or 15
+        if clinician
+        else 15
+    )
+    opens_at = scheduled_at - timedelta(minutes=15)
+    closes_at = scheduled_at + timedelta(minutes=duration_minutes + 30)
+    now = datetime.now(APPOINTMENT_TIMEZONE)
+    if now < opens_at:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Video access opens at "
+                f"{opens_at.strftime('%Y-%m-%d %H:%M %Z')}"
+            ),
+        )
+    if now > closes_at:
+        raise HTTPException(
+            status_code=410,
+            detail="The video consultation access window has closed",
+        )
+
+    db.add(
+        VideoConsultationEventModel(
+            appointment_id=appointment.id,
+            actor_email=current_user.email,
+            actor_role=current_user.role,
+            event_type="launch_authorized",
+            provider="comm360",
+        )
+    )
+    db.commit()
+    return {
+        "provider": "Comm360",
+        "launch_url": COMM360_BASE_URL,
+        "appointment_id": appointment.id,
+        "opens_at": opens_at.isoformat(),
+        "closes_at": closes_at.isoformat(),
+        "appointment_timezone": APPOINTMENT_TIMEZONE_NAME,
+        "notice": (
+            "Comm360 is an external service. Sign in there to continue. "
+            "No patient details are included in the launch URL."
+        ),
+    }
 
 
 @app.put("/api/appointments/{appointment_id}/status")
@@ -2997,6 +4053,45 @@ async def update_appointment_status(
         "message": f"Appointment {status_data.status} successfully",
         "appointment_id": appointment.id,
         "status": appointment.status
+    }
+
+
+@app.put("/api/appointments/{appointment_id}/notes")
+async def update_appointment_notes(
+    appointment_id: int,
+    notes_data: AppointmentNotesUpdate,
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    appointment = db.query(AppointmentModel).filter(
+        AppointmentModel.id == appointment_id
+    ).first()
+    if not appointment:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+
+    if current_user.role == "clinician":
+        if appointment.clinician_email != current_user.email:
+            raise HTTPException(
+                status_code=403,
+                detail="You can update notes only for your own appointments",
+            )
+    elif current_user.role != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Only the assigned clinician or an administrator can update notes",
+        )
+
+    appointment.notes = notes_data.notes.strip()
+    appointment.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(appointment)
+    return {
+        "message": "Appointment notes saved successfully",
+        "appointment_id": appointment.id,
+        "notes": appointment.notes,
+        "updated_at": (
+            appointment.updated_at.isoformat() if appointment.updated_at else None
+        ),
     }
 
 
@@ -3377,6 +4472,229 @@ async def delete_prescription(
 
 #====================Emergency alert system=================
 
+EMERGENCY_REVIEW_MINUTES = 5
+EMERGENCY_MAX_ESCALATION_LEVEL = 3
+
+
+def _record_emergency_event(
+    db: Session,
+    alert: EmergencyAlertModel,
+    event_type: str,
+    *,
+    actor_email: Optional[str] = None,
+    actor_role: Optional[str] = None,
+    notes: Optional[str] = None,
+) -> None:
+    db.add(
+        EmergencyAlertEventModel(
+            alert_id=alert.id,
+            event_type=event_type,
+            actor_email=actor_email,
+            actor_role=actor_role,
+            escalation_level=alert.escalation_level or 1,
+            notes=(notes or "").strip() or None,
+        )
+    )
+
+
+def _require_emergency_staff_access(
+    db: Session,
+    alert: EmergencyAlertModel,
+    current_user,
+) -> None:
+    if current_user.role == "admin":
+        return
+    if current_user.role != "clinician":
+        raise HTTPException(
+            status_code=403,
+            detail="Only clinicians or administrators can manage emergency alerts",
+        )
+    connection = db.query(MessageRequestModel).filter(
+        MessageRequestModel.patient_email == alert.patient_email,
+        MessageRequestModel.clinician_email == current_user.email,
+        MessageRequestModel.status == "accepted",
+    ).first()
+    if not connection:
+        raise HTTPException(
+            status_code=403,
+            detail="You can manage alerts only for connected patients",
+        )
+
+
+def _require_owner_or_admin(alert: EmergencyAlertModel, current_user) -> None:
+    if current_user.role == "admin":
+        return
+    if alert.owner_email != current_user.email:
+        raise HTTPException(
+            status_code=409,
+            detail="Claim this alert before performing this action",
+        )
+
+
+def _assign_emergency_owner(
+    alert: EmergencyAlertModel,
+    current_user,
+    *,
+    now: datetime,
+) -> None:
+    alert.owner_email = current_user.email
+    alert.owner_role = current_user.role
+    alert.ownership_assigned_at = now
+    alert.operational_state = "owned"
+    alert.last_monitored_at = now
+    alert.next_review_at = now + timedelta(minutes=EMERGENCY_REVIEW_MINUTES)
+
+
+def _queue_notification(
+    db: Session,
+    *,
+    user_email: str,
+    title: str,
+    message: str,
+    notification_type: str = "emergency",
+) -> None:
+    db.add(
+        NotificationModel(
+            user_email=user_email,
+            title=title,
+            message=message,
+            type=notification_type,
+            is_read=False,
+        )
+    )
+
+
+def _apply_due_emergency_escalations(db: Session) -> None:
+    """Apply the escalation policy whenever a staff monitoring view polls."""
+    now = datetime.utcnow()
+    due_alerts = db.query(EmergencyAlertModel).filter(
+        EmergencyAlertModel.status.in_(["active", "acknowledged"]),
+        EmergencyAlertModel.next_review_at.isnot(None),
+        EmergencyAlertModel.next_review_at <= now,
+    ).with_for_update(skip_locked=True).all()
+    if not due_alerts:
+        return
+
+    admin_emails = [row[0] for row in db.query(AdminModel.email).all()]
+    for alert in due_alerts:
+        previous_level = alert.escalation_level or 1
+        alert.escalation_level = min(
+            previous_level + 1,
+            EMERGENCY_MAX_ESCALATION_LEVEL,
+        )
+        alert.operational_state = "escalated"
+        alert.last_monitored_at = now
+        alert.next_review_at = now + timedelta(
+            minutes=(
+                EMERGENCY_REVIEW_MINUTES
+                if alert.escalation_level < EMERGENCY_MAX_ESCALATION_LEVEL
+                else EMERGENCY_REVIEW_MINUTES * 3
+            )
+        )
+        event_type = (
+            "auto_escalated"
+            if alert.escalation_level > previous_level
+            else "review_overdue"
+        )
+        _record_emergency_event(
+            db,
+            alert,
+            event_type,
+            notes=(
+                "The operational review deadline elapsed without a recorded "
+                "staff check-in."
+            ),
+        )
+
+        recipients = set(admin_emails)
+        recipients.update(
+            get_connected_clinician_emails_for_patient(db, alert.patient_email)
+        )
+        if alert.owner_email:
+            recipients.add(alert.owner_email)
+        for recipient in recipients:
+            _queue_notification(
+                db,
+                user_email=recipient,
+                title=f"SOS escalation level {alert.escalation_level}",
+                message=(
+                    f"The alert from {alert.patient_name or alert.patient_email} "
+                    "passed its review deadline and needs staff attention."
+                ),
+            )
+    db.commit()
+
+
+def _emergency_alert_payload(db: Session, alert: EmergencyAlertModel) -> dict:
+    patient = db.query(PatientModel).filter(
+        PatientModel.email == alert.patient_email
+    ).first()
+    events = db.query(EmergencyAlertEventModel).filter(
+        EmergencyAlertEventModel.alert_id == alert.id
+    ).order_by(EmergencyAlertEventModel.created_at.desc()).limit(10).all()
+    return {
+        "id": alert.id,
+        "patient_email": alert.patient_email,
+        "patient_name": alert.patient_name,
+        "alert_type": alert.alert_type,
+        "severity": alert.severity,
+        "message": alert.message,
+        "status": alert.status,
+        "acknowledged_by": alert.acknowledged_by,
+        "acknowledged_at": (
+            alert.acknowledged_at.isoformat() if alert.acknowledged_at else None
+        ),
+        "resolved_by": alert.resolved_by,
+        "resolved_at": alert.resolved_at.isoformat() if alert.resolved_at else None,
+        "escalation_level": alert.escalation_level or 1,
+        "owner_email": alert.owner_email,
+        "owner_role": alert.owner_role,
+        "ownership_assigned_at": (
+            alert.ownership_assigned_at.isoformat()
+            if alert.ownership_assigned_at else None
+        ),
+        "operational_state": alert.operational_state or "unassigned",
+        "last_monitored_at": (
+            alert.last_monitored_at.isoformat() if alert.last_monitored_at else None
+        ),
+        "next_review_at": (
+            alert.next_review_at.isoformat() if alert.next_review_at else None
+        ),
+        "escalation_deadline": (
+            alert.escalation_deadline.isoformat()
+            if alert.escalation_deadline else None
+        ),
+        "consent_version": alert.consent_version,
+        "consent_acknowledged": bool(alert.consent_acknowledged),
+        "created_at": alert.created_at.isoformat() if alert.created_at else None,
+        "updated_at": alert.updated_at.isoformat() if alert.updated_at else None,
+        "events": [
+            {
+                "id": event.id,
+                "event_type": event.event_type,
+                "actor_email": event.actor_email,
+                "actor_role": event.actor_role,
+                "escalation_level": event.escalation_level,
+                "notes": event.notes,
+                "created_at": (
+                    event.created_at.isoformat() if event.created_at else None
+                ),
+            }
+            for event in events
+        ],
+        "patient_details": {
+            "name": patient.name if patient else alert.patient_name,
+            "email": patient.email if patient else alert.patient_email,
+            "age": patient.age if patient else None,
+            "gender": patient.gender if patient else None,
+            "blood_type": patient.blood_type if patient else None,
+            "emergency_contact": patient.emergency_contact if patient else None,
+            "status": patient.status if patient else None,
+            "alerts": patient.alerts if patient else None,
+        },
+    }
+
+
 @app.post("/api/emergency-alerts")
 async def create_emergency_alert(
     alert_data: EmergencyAlertCreate,
@@ -3428,16 +4746,89 @@ async def create_emergency_alert(
             detail="Patient profile not found"
         )
 
+    consent = _active_consent(
+        db,
+        user_email=current_user.email,
+        consent_type="emergency_alert",
+    )
+    if not consent:
+        raise HTTPException(
+            status_code=428,
+            detail="Review and accept the SOS safety disclosure before using SOS",
+        )
+
+    now = datetime.utcnow()
+    existing_alert = db.query(EmergencyAlertModel).filter(
+        EmergencyAlertModel.patient_email == current_user.email,
+        EmergencyAlertModel.status.in_(["active", "acknowledged"]),
+    ).order_by(EmergencyAlertModel.created_at.desc()).first()
+    if existing_alert:
+        existing_alert.status = "active"
+        existing_alert.acknowledged_by = None
+        existing_alert.acknowledged_at = None
+        existing_alert.escalation_level = min(
+            (existing_alert.escalation_level or 1) + 1,
+            EMERGENCY_MAX_ESCALATION_LEVEL,
+        )
+        existing_alert.operational_state = "escalated"
+        existing_alert.next_review_at = now + timedelta(
+            minutes=EMERGENCY_REVIEW_MINUTES
+        )
+        existing_alert.escalation_deadline = now + timedelta(
+            minutes=EMERGENCY_REVIEW_MINUTES
+        )
+        existing_alert.consent_version = consent.consent_version
+        existing_alert.consent_acknowledged = True
+        _record_emergency_event(
+            db,
+            existing_alert,
+            "patient_reactivated",
+            actor_email=current_user.email,
+            actor_role=current_user.role,
+            notes="Patient activated SOS again while a response remained open.",
+        )
+        db.commit()
+        db.refresh(existing_alert)
+        notify_emergency_alert_receivers(db=db, alert=existing_alert)
+        return {
+            "message": "Existing emergency response escalated successfully",
+            "alert_id": existing_alert.id,
+            "status": existing_alert.status,
+            "reactivated": True,
+            "escalation_level": existing_alert.escalation_level,
+            "next_review_at": existing_alert.next_review_at.isoformat(),
+            "notice": (
+                "CareConnect re-notified the configured care team. This does "
+                "not automatically dispatch emergency services."
+            ),
+        }
+
     alert = EmergencyAlertModel(
         patient_email=current_user.email,
         patient_name=current_user.name,
         alert_type=alert_data.alert_type,
         severity=alert_data.severity,
         message=alert_data.message.strip(),
-        status="active"
+        status="active",
+        escalation_level=1,
+        operational_state="unassigned",
+        last_monitored_at=now,
+        next_review_at=now + timedelta(minutes=EMERGENCY_REVIEW_MINUTES),
+        escalation_deadline=now + timedelta(minutes=EMERGENCY_REVIEW_MINUTES * 2),
+        consent_version=consent.consent_version,
+        consent_acknowledged=True,
     )
 
     db.add(alert)
+    db.flush()
+    _record_emergency_event(
+        db,
+        alert,
+        "created",
+        actor_email=current_user.email,
+        actor_role=current_user.role,
+        notes="Patient activated the one-tap SOS control.",
+    )
     db.commit()
     db.refresh(alert)
 
@@ -3446,7 +4837,12 @@ async def create_emergency_alert(
     return {
         "message": "Emergency alert triggered successfully",
         "alert_id": alert.id,
-        "status": alert.status
+        "status": alert.status,
+        "next_review_at": alert.next_review_at.isoformat(),
+        "notice": (
+            "CareConnect notified the configured care team. This does not "
+            "automatically dispatch emergency services."
+        ),
     }
 
 
@@ -3459,8 +4855,9 @@ async def get_emergency_alerts(
     query = db.query(EmergencyAlertModel)
 
     if current_user.role == "patient":
-        query = query.filter(
-            EmergencyAlertModel.patient_email == current_user.email
+        raise HTTPException(
+            status_code=403,
+            detail="SOS updates are available through patient notifications"
         )
 
     elif current_user.role == "clinician":
@@ -3487,6 +4884,8 @@ async def get_emergency_alerts(
             detail="Not authorized to view emergency alerts"
         )
 
+    _apply_due_emergency_escalations(db)
+
     if status:
         query = query.filter(EmergencyAlertModel.status == status)
 
@@ -3494,40 +4893,96 @@ async def get_emergency_alerts(
         EmergencyAlertModel.created_at.desc()
     ).all()
 
-    result = []
+    return [_emergency_alert_payload(db, alert) for alert in alerts]
 
-    for alert in alerts:
-        patient = db.query(PatientModel).filter(
-            PatientModel.email == alert.patient_email
-        ).first()
 
-        result.append({
-            "id": alert.id,
-            "patient_email": alert.patient_email,
-            "patient_name": alert.patient_name,
-            "alert_type": alert.alert_type,
-            "severity": alert.severity,
-            "message": alert.message,
-            "status": alert.status,
-            "acknowledged_by": alert.acknowledged_by,
-            "acknowledged_at": alert.acknowledged_at.isoformat() if alert.acknowledged_at else None,
-            "resolved_by": alert.resolved_by,
-            "resolved_at": alert.resolved_at.isoformat() if alert.resolved_at else None,
-            "created_at": alert.created_at.isoformat() if alert.created_at else None,
-            "updated_at": alert.updated_at.isoformat() if alert.updated_at else None,
-            "patient_details": {
-                "name": patient.name if patient else alert.patient_name,
-                "email": patient.email if patient else alert.patient_email,
-                "age": patient.age if patient else None,
-                "gender": patient.gender if patient else None,
-                "blood_type": patient.blood_type if patient else None,
-                "emergency_contact": patient.emergency_contact if patient else None,
-                "status": patient.status if patient else None,
-                "alerts": patient.alerts if patient else None
+@app.get("/api/emergency-alerts/monitoring")
+async def get_emergency_alert_monitoring(
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if current_user.role not in ["clinician", "admin"]:
+        raise HTTPException(status_code=403, detail="Staff access is required")
+    _apply_due_emergency_escalations(db)
+
+    query = db.query(EmergencyAlertModel).filter(
+        EmergencyAlertModel.status.in_(["active", "acknowledged"])
+    )
+    if current_user.role == "clinician":
+        patient_emails = connected_patient_emails(db, current_user.email)
+        if not patient_emails:
+            return {
+                "active": 0,
+                "unassigned": 0,
+                "overdue": 0,
+                "escalated": 0,
+                "level_three": 0,
+                "response_target_minutes": EMERGENCY_REVIEW_MINUTES,
+                "monitoring_mode": "backend-monitor-with-dashboard-polling",
             }
-        })
+        query = query.filter(EmergencyAlertModel.patient_email.in_(patient_emails))
 
-    return result
+    now = datetime.utcnow()
+    scoped_alerts = query.all()
+    return {
+        "active": len(scoped_alerts),
+        "unassigned": sum(1 for item in scoped_alerts if not item.owner_email),
+        "overdue": sum(
+            1
+            for item in scoped_alerts
+            if item.next_review_at and item.next_review_at <= now
+        ),
+        "escalated": sum(
+            1 for item in scoped_alerts if (item.escalation_level or 1) >= 2
+        ),
+        "level_three": sum(
+            1 for item in scoped_alerts if (item.escalation_level or 1) >= 3
+        ),
+        "response_target_minutes": EMERGENCY_REVIEW_MINUTES,
+        "monitoring_mode": "backend-monitor-with-dashboard-polling",
+    }
+
+
+@app.put("/api/emergency-alerts/{alert_id}/claim")
+async def claim_emergency_alert(
+    alert_id: int,
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    alert = db.query(EmergencyAlertModel).filter(
+        EmergencyAlertModel.id == alert_id
+    ).first()
+    if not alert:
+        raise HTTPException(status_code=404, detail="Emergency alert not found")
+    _require_emergency_staff_access(db, alert, current_user)
+    if alert.status == "resolved":
+        raise HTTPException(status_code=409, detail="Resolved alerts cannot be claimed")
+    if alert.owner_email and alert.owner_email != current_user.email:
+        raise HTTPException(
+            status_code=409,
+            detail=f"This alert is already owned by {alert.owner_email}",
+        )
+
+    now = datetime.utcnow()
+    newly_claimed = not alert.owner_email
+    _assign_emergency_owner(alert, current_user, now=now)
+    _record_emergency_event(
+        db,
+        alert,
+        "claimed" if newly_claimed else "owner_check_in",
+        actor_email=current_user.email,
+        actor_role=current_user.role,
+        notes="Staff ownership confirmed.",
+    )
+    db.commit()
+    _queue_notification(
+        db,
+        user_email=alert.patient_email,
+        title="SOS response assigned",
+        message=f"{current_user.name} is now monitoring your SOS alert.",
+    )
+    db.commit()
+    return _emergency_alert_payload(db, alert)
 
 
 @app.put("/api/emergency-alerts/{alert_id}/acknowledge")
@@ -3549,22 +5004,30 @@ async def acknowledge_emergency_alert(
     if not alert:
         raise HTTPException(status_code=404, detail="Emergency alert not found")
 
-    if current_user.role == "clinician":
-        connection = db.query(MessageRequestModel).filter(
-            MessageRequestModel.patient_email == alert.patient_email,
-            MessageRequestModel.clinician_email == current_user.email,
-            MessageRequestModel.status == "accepted"
-        ).first()
+    _require_emergency_staff_access(db, alert, current_user)
+    if alert.status == "resolved":
+        raise HTTPException(status_code=409, detail="This alert is already resolved")
 
-        if not connection:
-            raise HTTPException(
-                status_code=403,
-                detail="You can acknowledge alerts only for connected patients"
-            )
-
+    now = datetime.utcnow()
+    if not alert.owner_email:
+        _assign_emergency_owner(alert, current_user, now=now)
+    else:
+        _require_owner_or_admin(alert, current_user)
     alert.status = "acknowledged"
     alert.acknowledged_by = current_user.email
-    alert.acknowledged_at = datetime.utcnow()
+    alert.acknowledged_at = now
+    alert.last_monitored_at = now
+    alert.next_review_at = now + timedelta(minutes=EMERGENCY_REVIEW_MINUTES)
+    if alert.operational_state != "escalated":
+        alert.operational_state = "owned"
+    _record_emergency_event(
+        db,
+        alert,
+        "acknowledged",
+        actor_email=current_user.email,
+        actor_role=current_user.role,
+        notes="Staff acknowledged the SOS and confirmed operational review.",
+    )
 
     db.commit()
     db.refresh(alert)
@@ -3582,6 +5045,89 @@ async def acknowledge_emergency_alert(
         "alert_id": alert.id,
         "status": alert.status
     }
+
+
+@app.put("/api/emergency-alerts/{alert_id}/check-in")
+async def check_in_emergency_alert(
+    alert_id: int,
+    note_data: EmergencyAlertNoteRequest,
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not note_data.notes or not note_data.notes.strip():
+        raise HTTPException(status_code=400, detail="A check-in note is required")
+    alert = db.query(EmergencyAlertModel).filter(
+        EmergencyAlertModel.id == alert_id
+    ).first()
+    if not alert:
+        raise HTTPException(status_code=404, detail="Emergency alert not found")
+    _require_emergency_staff_access(db, alert, current_user)
+    _require_owner_or_admin(alert, current_user)
+    if alert.status == "resolved":
+        raise HTTPException(status_code=409, detail="This alert is already resolved")
+
+    now = datetime.utcnow()
+    alert.last_monitored_at = now
+    alert.next_review_at = now + timedelta(minutes=EMERGENCY_REVIEW_MINUTES)
+    _record_emergency_event(
+        db,
+        alert,
+        "staff_check_in",
+        actor_email=current_user.email,
+        actor_role=current_user.role,
+        notes=note_data.notes,
+    )
+    db.commit()
+    return _emergency_alert_payload(db, alert)
+
+
+@app.put("/api/emergency-alerts/{alert_id}/escalate")
+async def escalate_emergency_alert(
+    alert_id: int,
+    escalation_data: EmergencyAlertEscalationRequest,
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not escalation_data.reason or not escalation_data.reason.strip():
+        raise HTTPException(status_code=400, detail="An escalation reason is required")
+    alert = db.query(EmergencyAlertModel).filter(
+        EmergencyAlertModel.id == alert_id
+    ).first()
+    if not alert:
+        raise HTTPException(status_code=404, detail="Emergency alert not found")
+    _require_emergency_staff_access(db, alert, current_user)
+    _require_owner_or_admin(alert, current_user)
+    if alert.status == "resolved":
+        raise HTTPException(status_code=409, detail="This alert is already resolved")
+    if (alert.escalation_level or 1) >= EMERGENCY_MAX_ESCALATION_LEVEL:
+        raise HTTPException(status_code=409, detail="Alert is already at level 3")
+
+    now = datetime.utcnow()
+    alert.escalation_level = (alert.escalation_level or 1) + 1
+    alert.operational_state = "escalated"
+    alert.last_monitored_at = now
+    alert.next_review_at = now + timedelta(minutes=EMERGENCY_REVIEW_MINUTES)
+    _record_emergency_event(
+        db,
+        alert,
+        "manually_escalated",
+        actor_email=current_user.email,
+        actor_role=current_user.role,
+        notes=escalation_data.reason,
+    )
+    admin_emails = [row[0] for row in db.query(AdminModel.email).all()]
+    for admin_email in admin_emails:
+        _queue_notification(
+            db,
+            user_email=admin_email,
+            title=f"SOS escalated to level {alert.escalation_level}",
+            message=(
+                f"{current_user.name} escalated the alert from "
+                f"{alert.patient_name or alert.patient_email}."
+            ),
+        )
+    db.commit()
+    return _emergency_alert_payload(db, alert)
 
 
 @app.put("/api/emergency-alerts/{alert_id}/resolve")
@@ -3603,22 +5149,33 @@ async def resolve_emergency_alert(
     if not alert:
         raise HTTPException(status_code=404, detail="Emergency alert not found")
 
-    if current_user.role == "clinician":
-        connection = db.query(MessageRequestModel).filter(
-            MessageRequestModel.patient_email == alert.patient_email,
-            MessageRequestModel.clinician_email == current_user.email,
-            MessageRequestModel.status == "accepted"
-        ).first()
+    _require_emergency_staff_access(db, alert, current_user)
+    if alert.status == "resolved":
+        return {
+            "message": "Emergency alert is already resolved",
+            "alert_id": alert.id,
+            "status": alert.status,
+        }
 
-        if not connection:
-            raise HTTPException(
-                status_code=403,
-                detail="You can resolve alerts only for connected patients"
-            )
-
+    now = datetime.utcnow()
+    if not alert.owner_email:
+        _assign_emergency_owner(alert, current_user, now=now)
+    else:
+        _require_owner_or_admin(alert, current_user)
     alert.status = "resolved"
     alert.resolved_by = current_user.email
-    alert.resolved_at = datetime.utcnow()
+    alert.resolved_at = now
+    alert.operational_state = "resolved"
+    alert.last_monitored_at = now
+    alert.next_review_at = None
+    _record_emergency_event(
+        db,
+        alert,
+        "resolved",
+        actor_email=current_user.email,
+        actor_role=current_user.role,
+        notes="Staff marked the SOS response workflow as resolved.",
+    )
 
     db.commit()
     db.refresh(alert)
@@ -3654,44 +5211,18 @@ async def delete_emergency_alert(
             detail="Emergency alert not found"
         )
 
-    # Patient can delete only their own emergency alert
-    if current_user.role == "patient":
-        if alert.patient_email != current_user.email:
-            raise HTTPException(
-                status_code=403,
-                detail="You can delete only your own emergency alerts"
-            )
-
-    # Clinician can delete only alerts from connected patients
-    elif current_user.role == "clinician":
-        connection = db.query(MessageRequestModel).filter(
-            MessageRequestModel.patient_email == alert.patient_email,
-            MessageRequestModel.clinician_email == current_user.email,
-            MessageRequestModel.status == "accepted"
-        ).first()
-
-        if not connection:
-            raise HTTPException(
-                status_code=403,
-                detail="You can delete alerts only for connected patients"
-            )
-
-    # Admin can delete any emergency alert
-    elif current_user.role == "admin":
-        pass
-
-    else:
+    if current_user.role != "admin":
         raise HTTPException(
             status_code=403,
-            detail="Not authorized to delete emergency alerts"
+            detail="Only administrators can delete emergency alert records"
         )
-
-    db.delete(alert)
-    db.commit()
-
-    return {
-        "message": "Emergency alert deleted successfully"
-    }
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            "SOS records are retained with their response history. "
+            "Resolve the alert instead of deleting it."
+        ),
+    )
 
 
 # ================== NOTIFICATION SYSTEM ==================
@@ -3905,20 +5436,18 @@ async def upload_record_version(
     if record.patient_email != current_user.email:
         raise HTTPException(status_code=403, detail="You can upload versions only for your own records")
 
-    upload_folder = f"uploads/medical_records/{current_user.email}/versions"
-    os.makedirs(upload_folder, exist_ok=True)
-
-    file_extension = os.path.splitext(file.filename)[1]
-    safe_filename = file.filename.replace(" ", "_")
-    unique_filename = f"record_{record_id}_version_{datetime.utcnow().timestamp()}_{safe_filename}"
-    file_path = f"{upload_folder}/{unique_filename}"
-
-    content = await file.read()
-
-    with open(file_path, "wb") as f:
-        f.write(content)
-
-    file_type = file.content_type or mimetypes.guess_type(file.filename)[0] or "application/octet-stream"
+    original_name, extension, file_type, content = await read_validated_upload(
+        file,
+        allowed_extensions=MEDICAL_UPLOAD_EXTENSIONS,
+        max_bytes=MEDICAL_UPLOAD_MAX_BYTES,
+    )
+    file_path = store_upload(
+        content=content,
+        storage_root=UPLOAD_STORAGE_ROOT,
+        purpose=f"medical-records/{record_id}/versions",
+        owner_key=current_user.email,
+        extension=extension,
+    )
 
     extracted_text = None
     analysis_summary = None
@@ -3926,7 +5455,7 @@ async def upload_record_version(
     key_findings = None
 
     try:
-        extracted_text = extract_text_from_path(file_path)
+        extracted_text = extract_text_from_path(str(file_path))
 
         if extracted_text:
             try:
@@ -3950,8 +5479,8 @@ async def upload_record_version(
         record_id=record.id,
         patient_email=record.patient_email,
         uploaded_by=current_user.email,
-        file_name=file.filename,
-        file_path=file_path,
+        file_name=original_name,
+        file_path=str(file_path),
         file_type=file_type,
         file_size=len(content),
         change_notes=change_notes,
@@ -3961,7 +5490,7 @@ async def upload_record_version(
         key_findings=key_findings
     )
 
-    record.file_path = file_path
+    record.file_path = str(file_path)
     record.uploaded_at = datetime.utcnow()
 
     if analysis_summary:
@@ -3987,28 +5516,9 @@ async def upload_record_version(
 @app.get("/api/records/versions/{version_id}/download")
 async def download_record_version(
     version_id: int,
-    token: Optional[str] = None,
+    current_user=Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    if not token:
-        raise HTTPException(status_code=401, detail="No token provided")
-
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        email = payload.get("sub")
-        role = payload.get("role")
-
-        if not email or not role:
-            raise HTTPException(status_code=401, detail="Invalid token")
-
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    current_user = get_user_by_email_and_role(db, email, role)
-
-    if not current_user:
-        raise HTTPException(status_code=401, detail="User not found")
-
     version = db.query(RecordVersionModel).filter(
         RecordVersionModel.id == version_id
     ).first()
@@ -4113,7 +5623,7 @@ async def delete_record(
         print("Delete record error:", e)
         raise HTTPException(
             status_code=500,
-            detail="Failed to delete record: {str(e)}"
+            detail="Failed to delete record"
         )
 
 # ================== AUTH ==================
@@ -4151,7 +5661,7 @@ async def forgot_password(
     token = secrets.token_urlsafe(32)
     expiry = datetime.utcnow() + timedelta(minutes=15)
 
-    user.reset_password_token = token
+    user.reset_password_token = hashlib.sha256(token.encode("utf-8")).hexdigest()
     user.reset_password_expires = expiry
     db.commit()
 
@@ -4177,18 +5687,20 @@ async def reset_password(
     # Validate new password using your existing logic
     validate_password(data.password)
 
-    # Find user with valid token
+    token_digest = hashlib.sha256(data.token.encode("utf-8")).hexdigest()
+
+    # Find user with a valid hashed token
     user = (
         db.query(PatientModel).filter(
-            PatientModel.reset_password_token == data.token,
+            PatientModel.reset_password_token == token_digest,
             PatientModel.reset_password_expires > datetime.utcnow()
         ).first()
         or db.query(ClinicianModel).filter(
-            ClinicianModel.reset_password_token == data.token,
+            ClinicianModel.reset_password_token == token_digest,
             ClinicianModel.reset_password_expires > datetime.utcnow()
         ).first()
         or db.query(AdminModel).filter(
-            AdminModel.reset_password_token == data.token,
+            AdminModel.reset_password_token == token_digest,
             AdminModel.reset_password_expires > datetime.utcnow()
         ).first()
     )
@@ -4204,6 +5716,17 @@ async def reset_password(
     user.reset_password_token = None
     user.reset_password_expires = None
 
+    db.query(UserSessionModel).filter(
+        UserSessionModel.user_email == user.email,
+        UserSessionModel.user_role == user.role,
+        UserSessionModel.revoked_at.is_(None),
+    ).update(
+        {
+            UserSessionModel.revoked_at: datetime.utcnow(),
+            UserSessionModel.revoke_reason: "password_reset",
+        },
+        synchronize_session=False,
+    )
     db.commit()
 
     return {"message": "Password reset successful. You can now login."}
@@ -4298,7 +5821,11 @@ async def register(user_data: UserRegister, db: Session = Depends(get_db)):
 #     return {"message": "Email verified successfully. Please login."}
 
 @app.post("/api/auth/login", response_model=Token)
-async def login(user_data: UserLogin, db: Session = Depends(get_db)):
+async def login(
+    user_data: UserLogin,
+    request: Request,
+    db: Session = Depends(get_db),
+):
     identifier = user_data.email.strip()
     default_admin_username = os.getenv("DEFAULT_ADMIN_USERNAME", "").strip()
     default_admin_email = os.getenv("DEFAULT_ADMIN_EMAIL", "").strip()
@@ -4321,9 +5848,11 @@ async def login(user_data: UserLogin, db: Session = Depends(get_db)):
     if not user or not verify_password(user_data.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Incorrect email or password")
 
-    # skip_email_verification = os.getenv("SKIP_EMAIL_VERIFICATION", "false").lower() == "true"
-    # if not skip_email_verification and not getattr(user, "email_verified", True):
-        # raise HTTPException(status_code=403, detail="Email not verified. Please verify and login again.")
+    if not getattr(user, "is_active", True):
+        raise HTTPException(status_code=403, detail="This account is inactive")
+
+    if REQUIRE_EMAIL_VERIFICATION and not getattr(user, "email_verified", False):
+        raise HTTPException(status_code=403, detail="Email not verified")
 
     if getattr(user, "role", None) == "clinician":
         approval_status = getattr(user, "approval_status", "approved")
@@ -4333,11 +5862,13 @@ async def login(user_data: UserLogin, db: Session = Depends(get_db)):
                 detail="Clinician account pending approval. Please wait for admin approval."
             )
     
-    access_token = create_access_token(data={"sub": user.email, "role": user.role})
+    access_token, session = create_user_session_token(user, db, request)
     
     return {
         "access_token": access_token,
         "token_type": "bearer",
+        "expires_at": session.expires_at.isoformat(),
+        "session_id": session.id,
         "user": {
             "id": user.id,
             "name": user.name,
@@ -4346,7 +5877,11 @@ async def login(user_data: UserLogin, db: Session = Depends(get_db)):
         }
     }
 @app.post("/api/auth/google", response_model=Token)
-async def google_auth(auth_data: GoogleAuthRequest, db: Session = Depends(get_db)):
+async def google_auth(
+    auth_data: GoogleAuthRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
     try:
         # ✅ VERIFY GOOGLE ID TOKEN
         idinfo = id_token.verify_oauth2_token(
@@ -4356,10 +5891,9 @@ async def google_auth(auth_data: GoogleAuthRequest, db: Session = Depends(get_db
         )
 
         google_email = idinfo.get("email")
-        google_name = idinfo.get("name", google_email.split("@")[0])
-
         if not google_email:
             raise HTTPException(status_code=400, detail="Google email not found")
+        google_name = idinfo.get("name") or google_email.split("@")[0]
 
     except Exception as e:
         print("❌ GOOGLE TOKEN ERROR:", e)
@@ -4409,14 +5943,21 @@ async def google_auth(auth_data: GoogleAuthRequest, db: Session = Depends(get_db
         user.email_verification_expires = None
         db.commit()
 
-    access_token = create_access_token({
-        "sub": user.email,
-        "role": user.role
-    })
+    if not getattr(user, "is_active", True):
+        raise HTTPException(status_code=403, detail="This account is inactive")
+    if user.role == "clinician" and getattr(user, "approval_status", None) != "approved":
+        raise HTTPException(
+            status_code=403,
+            detail="Clinician account pending approval. Please wait for admin approval.",
+        )
+
+    access_token, session = create_user_session_token(user, db, request)
 
     return {
         "access_token": access_token,
         "token_type": "bearer",
+        "expires_at": session.expires_at.isoformat(),
+        "session_id": session.id,
         "user": {
             "id": user.id,
             "name": user.name,
@@ -4434,6 +5975,75 @@ async def get_current_user_info(current_user = Depends(get_current_user)):
         "email": current_user.email,
         "role": current_user.role
     }
+
+
+@app.post("/api/auth/logout")
+async def logout_current_session(
+    request: Request,
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    session_id = getattr(request.state, "session_id", None)
+    session = db.query(UserSessionModel).filter(
+        UserSessionModel.id == session_id,
+        UserSessionModel.user_email == current_user.email,
+        UserSessionModel.user_role == current_user.role,
+    ).first()
+    if session and session.revoked_at is None:
+        session.revoked_at = datetime.utcnow()
+        session.revoke_reason = "user_logout"
+        db.commit()
+    return {"message": "Session ended"}
+
+
+@app.get("/api/auth/sessions")
+async def list_user_sessions(
+    request: Request,
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    now = datetime.utcnow()
+    sessions = db.query(UserSessionModel).filter(
+        UserSessionModel.user_email == current_user.email,
+        UserSessionModel.user_role == current_user.role,
+        UserSessionModel.expires_at > now,
+    ).order_by(UserSessionModel.last_seen_at.desc()).all()
+    current_session_id = getattr(request.state, "session_id", None)
+    return {
+        "sessions": [
+            {
+                "id": item.id,
+                "user_agent": item.user_agent or "Unknown device",
+                "ip_address": item.ip_address,
+                "created_at": item.created_at.isoformat() if item.created_at else None,
+                "last_seen_at": item.last_seen_at.isoformat() if item.last_seen_at else None,
+                "expires_at": item.expires_at.isoformat() if item.expires_at else None,
+                "revoked": item.revoked_at is not None,
+                "current": item.id == current_session_id,
+            }
+            for item in sessions
+        ]
+    }
+
+
+@app.delete("/api/auth/sessions/{session_id}")
+async def revoke_user_session(
+    session_id: int,
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    session = db.query(UserSessionModel).filter(
+        UserSessionModel.id == session_id,
+        UserSessionModel.user_email == current_user.email,
+        UserSessionModel.user_role == current_user.role,
+    ).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if session.revoked_at is None:
+        session.revoked_at = datetime.utcnow()
+        session.revoke_reason = "user_revoked"
+        db.commit()
+    return {"message": "Session revoked"}
 
 @app.get("/api/messages")
 async def get_messages(db: Session = Depends(get_db), current_user = Depends(get_current_user)):
@@ -4498,29 +6108,343 @@ async def delete_account(current_user=Depends(get_current_user), db: Session = D
         raise HTTPException(status_code=500, detail=f"Error deleting account: {str(e)}")
 
 @app.get("/api/records")
-async def get_records(db: Session = Depends(get_db), current_user = Depends(get_current_user)):
-    if current_user.role == "patient":
-        records = db.query(RecordModel).filter(
-            RecordModel.patient_email == current_user.email
-        ).order_by(RecordModel.uploaded_at.desc()).all()
-    else:
-        # Clinicians and admins can see all records
-        records = db.query(RecordModel).order_by(RecordModel.uploaded_at.desc()).all()
-    
+async def get_records(
+    q: Optional[str] = Query(None, max_length=100),
+    category_code: Optional[str] = Query(None, max_length=50),
+    record_type: Optional[str] = Query(None, max_length=100),
+    patient_email: Optional[str] = Query(None, max_length=100),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=100),
+    db: Session = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    allowed_patients = accessible_patient_emails(db, current_user)
+    query = db.query(RecordModel)
+    if allowed_patients is not None:
+        if not allowed_patients:
+            return {"records": [], "total": 0, "page": page, "page_size": page_size}
+        query = query.filter(RecordModel.patient_email.in_(allowed_patients))
+
+    if patient_email:
+        require_patient_access(db, current_user, patient_email)
+        query = query.filter(RecordModel.patient_email == patient_email)
+    if q and q.strip():
+        term = f"%{q.strip()}%"
+        query = query.filter(
+            or_(
+                RecordModel.name.ilike(term),
+                RecordModel.type.ilike(term),
+                RecordModel.category.ilike(term),
+                RecordModel.tags.ilike(term),
+                RecordModel.analysis_summary.ilike(term),
+            )
+        )
+    if category_code:
+        normalized_code, _ = normalize_category(category_code)
+        query = query.filter(RecordModel.category_code == normalized_code)
+    if record_type:
+        query = query.filter(RecordModel.type == record_type.strip())
+
+    normalized_from = parse_iso_date(date_from, "date_from")
+    normalized_to = parse_iso_date(date_to, "date_to")
+    if normalized_from:
+        query = query.filter(RecordModel.uploaded_at >= datetime.strptime(normalized_from, "%Y-%m-%d"))
+    if normalized_to:
+        query = query.filter(
+            RecordModel.uploaded_at < datetime.strptime(normalized_to, "%Y-%m-%d") + timedelta(days=1)
+        )
+
+    total = query.count()
+    records = query.order_by(RecordModel.uploaded_at.desc()).offset(
+        (page - 1) * page_size
+    ).limit(page_size).all()
+
     return {
         "records": [
             {
                 "id": rec.id,
+                "patient_email": rec.patient_email if current_user.role != "patient" else None,
                 "type": rec.type,
                 "name": rec.name,
                 "date": str(rec.uploaded_at.date()),
                 "category": rec.category,
+                "category_code": getattr(rec, "category_code", "other") or "other",
+                "tags": _safe_json_loads(getattr(rec, "tags", None), []),
+                "source_date": getattr(rec, "source_date", None),
                 "analysis_summary": rec.analysis_summary or "No analysis available",
                 "has_metrics": bool(rec.metrics_data),
-                "findings_count": len(json.loads(rec.key_findings)) if rec.key_findings else 0
+                "findings_count": len(_safe_json_loads(rec.key_findings, []))
             }
             for rec in records
-        ]
+        ],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
+
+
+@app.get("/api/records/categories")
+async def get_record_categories(current_user=Depends(get_current_user)):
+    return {"categories": RECORD_CATEGORIES}
+
+
+@app.patch("/api/records/{record_id}/classification")
+async def update_record_classification(
+    record_id: int,
+    classification: dict,
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    record = db.query(RecordModel).filter(RecordModel.id == record_id).first()
+    if not record:
+        raise HTTPException(status_code=404, detail="Record not found")
+    require_patient_access(db, current_user, record.patient_email)
+
+    code, label = normalize_category(
+        classification.get("category_code") or classification.get("category")
+    )
+    tags = normalize_tags(
+        json.dumps(classification.get("tags", []))
+        if isinstance(classification.get("tags"), list)
+        else classification.get("tags")
+    )
+    source_date = parse_iso_date(classification.get("source_date"), "source_date")
+    record.category_code = code
+    record.category = label
+    record.tags = json.dumps(tags)
+    record.source_date = source_date
+    db.commit()
+    return {
+        "message": "Record classification updated",
+        "record": {
+            "id": record.id,
+            "category": record.category,
+            "category_code": record.category_code,
+            "tags": tags,
+            "source_date": record.source_date,
+        },
+    }
+
+
+@app.get("/api/clinical/search")
+async def search_clinical_data(
+    q: Optional[str] = Query(None, max_length=100),
+    resource_types: str = Query("records,prescriptions,appointments,patients", max_length=120),
+    patient_email: Optional[str] = Query(None, max_length=100),
+    category_code: Optional[str] = Query(None, max_length=50),
+    status_filter: Optional[str] = Query(None, alias="status", max_length=30),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=100),
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Role-scoped search across the main clinical resources."""
+
+    requested_types = {
+        item.strip().lower()
+        for item in resource_types.split(",")
+        if item.strip()
+    }
+    allowed_types = {"records", "prescriptions", "appointments", "patients"}
+    if not requested_types or not requested_types.issubset(allowed_types):
+        raise HTTPException(status_code=400, detail="Invalid resource_types value")
+
+    normalized_from = parse_iso_date(date_from, "date_from")
+    normalized_to = parse_iso_date(date_to, "date_to")
+    allowed_patients = accessible_patient_emails(db, current_user)
+    if patient_email:
+        require_patient_access(db, current_user, patient_email)
+        scoped_patients: Optional[Set[str]] = {patient_email}
+    else:
+        scoped_patients = allowed_patients
+    if scoped_patients is not None and not scoped_patients:
+        return {
+            "results": [],
+            "facets": {"resource_types": {}, "categories": {}},
+            "total": 0,
+            "page": page,
+            "page_size": page_size,
+        }
+
+    text_query = (q or "").strip()
+    text_term = f"%{text_query}%" if text_query else None
+    results = []
+
+    if "records" in requested_types:
+        record_query = db.query(RecordModel)
+        if scoped_patients is not None:
+            record_query = record_query.filter(RecordModel.patient_email.in_(scoped_patients))
+        if text_term:
+            record_query = record_query.filter(
+                or_(
+                    RecordModel.name.ilike(text_term),
+                    RecordModel.type.ilike(text_term),
+                    RecordModel.category.ilike(text_term),
+                    RecordModel.tags.ilike(text_term),
+                    RecordModel.analysis_summary.ilike(text_term),
+                )
+            )
+        if category_code:
+            normalized_code, _ = normalize_category(category_code)
+            record_query = record_query.filter(RecordModel.category_code == normalized_code)
+        if normalized_from:
+            record_query = record_query.filter(
+                RecordModel.uploaded_at >= datetime.strptime(normalized_from, "%Y-%m-%d")
+            )
+        if normalized_to:
+            record_query = record_query.filter(
+                RecordModel.uploaded_at < datetime.strptime(normalized_to, "%Y-%m-%d") + timedelta(days=1)
+            )
+        for record in record_query.order_by(RecordModel.uploaded_at.desc()).limit(250).all():
+            results.append(
+                {
+                    "resource_type": "record",
+                    "id": record.id,
+                    "patient_email": record.patient_email,
+                    "title": record.name,
+                    "subtitle": record.analysis_summary or record.type,
+                    "category": record.category,
+                    "category_code": getattr(record, "category_code", "other") or "other",
+                    "status": None,
+                    "date": (
+                        getattr(record, "source_date", None)
+                        or (record.uploaded_at.isoformat() if record.uploaded_at else None)
+                    ),
+                    "tags": _safe_json_loads(getattr(record, "tags", None), []),
+                }
+            )
+
+    if "prescriptions" in requested_types:
+        prescription_query = db.query(PrescriptionModel)
+        if scoped_patients is not None:
+            prescription_query = prescription_query.filter(
+                PrescriptionModel.patient_email.in_(scoped_patients)
+            )
+        if text_term:
+            prescription_query = prescription_query.filter(
+                or_(
+                    PrescriptionModel.medicine_name.ilike(text_term),
+                    PrescriptionModel.diagnosis.ilike(text_term),
+                    PrescriptionModel.instructions.ilike(text_term),
+                )
+            )
+        if status_filter:
+            prescription_query = prescription_query.filter(
+                PrescriptionModel.status == status_filter
+            )
+        if normalized_from:
+            prescription_query = prescription_query.filter(
+                PrescriptionModel.created_at >= datetime.strptime(normalized_from, "%Y-%m-%d")
+            )
+        if normalized_to:
+            prescription_query = prescription_query.filter(
+                PrescriptionModel.created_at < datetime.strptime(normalized_to, "%Y-%m-%d") + timedelta(days=1)
+            )
+        for prescription in prescription_query.order_by(PrescriptionModel.created_at.desc()).limit(250).all():
+            results.append(
+                {
+                    "resource_type": "prescription",
+                    "id": prescription.id,
+                    "patient_email": prescription.patient_email,
+                    "title": prescription.medicine_name,
+                    "subtitle": prescription.diagnosis or prescription.instructions or "Prescription",
+                    "category": "Prescription",
+                    "category_code": "prescription",
+                    "status": prescription.status,
+                    "date": prescription.created_at.isoformat() if prescription.created_at else None,
+                    "tags": [],
+                }
+            )
+
+    if "appointments" in requested_types:
+        appointment_query = db.query(AppointmentModel)
+        if scoped_patients is not None:
+            appointment_query = appointment_query.filter(
+                AppointmentModel.patient_email.in_(scoped_patients)
+            )
+        if text_term:
+            appointment_query = appointment_query.filter(
+                or_(
+                    AppointmentModel.reason.ilike(text_term),
+                    AppointmentModel.notes.ilike(text_term),
+                    AppointmentModel.clinician_email.ilike(text_term),
+                )
+            )
+        if status_filter:
+            appointment_query = appointment_query.filter(
+                AppointmentModel.status == status_filter
+            )
+        if normalized_from:
+            appointment_query = appointment_query.filter(
+                AppointmentModel.appointment_date >= normalized_from
+            )
+        if normalized_to:
+            appointment_query = appointment_query.filter(
+                AppointmentModel.appointment_date <= normalized_to
+            )
+        for appointment in appointment_query.order_by(
+            AppointmentModel.appointment_date.desc(),
+            AppointmentModel.appointment_time.desc(),
+        ).limit(250).all():
+            results.append(
+                {
+                    "resource_type": "appointment",
+                    "id": appointment.id,
+                    "patient_email": appointment.patient_email,
+                    "title": f"Appointment with {appointment.clinician_email}",
+                    "subtitle": appointment.reason,
+                    "category": appointment.appointment_type,
+                    "category_code": None,
+                    "status": appointment.status,
+                    "date": f"{appointment.appointment_date}T{appointment.appointment_time}",
+                    "tags": [],
+                }
+            )
+
+    if "patients" in requested_types:
+        patient_query = db.query(PatientModel)
+        if scoped_patients is not None:
+            patient_query = patient_query.filter(PatientModel.email.in_(scoped_patients))
+        if text_term:
+            patient_query = patient_query.filter(
+                or_(PatientModel.name.ilike(text_term), PatientModel.email.ilike(text_term))
+            )
+        for patient in patient_query.order_by(PatientModel.name.asc()).limit(250).all():
+            results.append(
+                {
+                    "resource_type": "patient",
+                    "id": patient.id,
+                    "patient_email": patient.email,
+                    "title": patient.name,
+                    "subtitle": f"Patient profile · {patient.status or 'unknown'}",
+                    "category": "Patient",
+                    "category_code": None,
+                    "status": patient.status,
+                    "date": patient.created_at.isoformat() if patient.created_at else None,
+                    "tags": [],
+                }
+            )
+
+    results.sort(key=lambda item: item.get("date") or "", reverse=True)
+    resource_facets: Dict[str, int] = {}
+    category_facets: Dict[str, int] = {}
+    for item in results:
+        resource_facets[item["resource_type"]] = resource_facets.get(item["resource_type"], 0) + 1
+        if item.get("category"):
+            category_facets[item["category"]] = category_facets.get(item["category"], 0) + 1
+
+    total = len(results)
+    offset = (page - 1) * page_size
+    return {
+        "results": results[offset:offset + page_size],
+        "facets": {"resource_types": resource_facets, "categories": category_facets},
+        "total": total,
+        "page": page,
+        "page_size": page_size,
     }
 
 @app.get("/api/patients/me/timeline")
@@ -4589,14 +6513,20 @@ async def get_patient_health_timeline(
 async def get_patients(db: Session = Depends(get_db), current_user = Depends(get_current_user)):
     if current_user.role not in ["clinician", "admin"]:
         raise HTTPException(status_code=403, detail="Not authorized")
-    
-    # Get all patients from patients table
-    patients = db.query(PatientModel).all()
+
+    query = db.query(PatientModel)
+    if current_user.role == "clinician":
+        allowed = connected_patient_emails(db, current_user.email)
+        if not allowed:
+            return {"patients": []}
+        query = query.filter(PatientModel.email.in_(allowed))
+    patients = query.order_by(PatientModel.name.asc()).all()
     
     return {
         "patients": [
             {
                 "id": p.id,
+                "email": p.email,
                 "name": p.name,
                 "age": p.age or 0,
                 "lastVisit": str(p.last_visit) if p.last_visit else "Never",
@@ -4620,8 +6550,19 @@ async def get_patient_clinical_profile(
             MessageRequestModel.clinician_email == current_user.email,
             MessageRequestModel.status == "accepted",
         ).first()
-        if not connection:
-            raise HTTPException(status_code=403, detail="You can view only connected patients")
+        care_appointment = db.query(AppointmentModel).filter(
+            AppointmentModel.patient_email == patient_email,
+            AppointmentModel.clinician_email == current_user.email,
+            AppointmentModel.status.in_(["approved", "completed"]),
+        ).first()
+        if not connection and not care_appointment:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "A messaging connection or approved appointment is required "
+                    "to open the full patient profile"
+                ),
+            )
     elif current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Clinician or admin access required")
 
@@ -4659,6 +6600,9 @@ async def get_patient_clinical_profile(
             {
                 "id": record.id, "name": record.name, "type": record.type,
                 "category": record.category,
+                "category_code": getattr(record, "category_code", "other") or "other",
+                "tags": _safe_json_loads(getattr(record, "tags", None), []),
+                "source_date": getattr(record, "source_date", None),
                 "uploaded_at": record.uploaded_at.isoformat() if record.uploaded_at else None,
                 "analysis_summary": record.analysis_summary,
                 "key_findings": _safe_json_loads(record.key_findings, []),
@@ -4678,6 +6622,321 @@ async def get_patient_clinical_profile(
         ],
     }
 
+
+@app.get("/api/patients/{patient_email}/appointment-summary")
+async def get_patient_appointment_summary(
+    patient_email: str,
+    appointment_id: int = Query(..., gt=0),
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    appointment = db.query(AppointmentModel).filter(
+        AppointmentModel.id == appointment_id,
+        AppointmentModel.patient_email == patient_email,
+    ).first()
+    if not appointment:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+
+    if current_user.role == "clinician":
+        if appointment.clinician_email != current_user.email:
+            raise HTTPException(
+                status_code=403,
+                detail="You can view summaries only for your own appointments",
+            )
+    elif current_user.role != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Clinician or administrator access is required",
+        )
+
+    patient = db.query(PatientModel).filter(
+        PatientModel.email == patient_email
+    ).first()
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
+    connection = db.query(MessageRequestModel).filter(
+        MessageRequestModel.patient_email == patient_email,
+        MessageRequestModel.clinician_email == current_user.email,
+        MessageRequestModel.status == "accepted",
+    ).first() if current_user.role == "clinician" else None
+    if (
+        current_user.role == "clinician"
+        and not connection
+        and appointment.status not in ["pending", "approved", "completed"]
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="This appointment no longer grants access to a patient summary",
+        )
+    can_open_profile = (
+        current_user.role == "admin"
+        or bool(connection)
+        or appointment.status in ["approved", "completed"]
+    )
+    can_message = current_user.role == "clinician" and bool(connection)
+
+    record_count = None
+    latest_record = None
+    prescription_stats = {}
+    if can_open_profile:
+        record_count = db.query(RecordModel).filter(
+            RecordModel.patient_email == patient_email
+        ).count()
+        latest_record = db.query(RecordModel).filter(
+            RecordModel.patient_email == patient_email,
+            RecordModel.analysis_summary.isnot(None),
+        ).order_by(RecordModel.uploaded_at.desc()).first()
+        prescription_stats = db.execute(
+            text(
+                "SELECT COUNT(*) AS total, "
+                "SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active "
+                "FROM prescriptions WHERE patient_email = :email"
+            ),
+            {"email": patient_email},
+        ).mappings().first()
+
+    recent_appointment_query = db.query(AppointmentModel).filter(
+        AppointmentModel.patient_email == patient_email,
+        AppointmentModel.id != appointment.id,
+    )
+    if current_user.role == "clinician" and not can_open_profile:
+        recent_appointment_query = recent_appointment_query.filter(
+            AppointmentModel.clinician_email == current_user.email
+        )
+    recent_appointments = recent_appointment_query.order_by(
+        AppointmentModel.appointment_date.desc(),
+        AppointmentModel.appointment_time.desc(),
+    ).limit(3).all()
+
+    blood_pressure = None
+    if patient.systolic_bp and patient.diastolic_bp:
+        blood_pressure = f"{patient.systolic_bp}/{patient.diastolic_bp}"
+
+    return {
+        "patient": {
+            "id": patient.id,
+            "name": patient.name,
+            "email": patient.email,
+            "age": patient.age,
+            "gender": patient.gender,
+            "blood_type": patient.blood_type,
+            "status": patient.status,
+            "alerts": patient.alerts,
+            "last_visit": (
+                patient.last_visit.isoformat() if patient.last_visit else None
+            ),
+            "weight_kg": patient.weight_kg,
+            "bmi": _patient_profile_payload(patient).get("bmi"),
+            "blood_pressure": blood_pressure,
+        },
+        "clinical_overview": (
+            latest_record.analysis_summary[:500]
+            if latest_record and latest_record.analysis_summary
+            else (
+                "No analyzed clinical summary is available yet."
+                if can_open_profile
+                else "Clinical details become available after appointment approval."
+            )
+        ),
+        "record_count": record_count,
+        "prescription_count": (
+            int((prescription_stats or {}).get("total") or 0)
+            if can_open_profile else None
+        ),
+        "active_prescription_count": (
+            int((prescription_stats or {}).get("active") or 0)
+            if can_open_profile else None
+        ),
+        "recent_appointments": [
+            {
+                "id": item.id,
+                "appointment_date": item.appointment_date,
+                "appointment_time": item.appointment_time,
+                "appointment_type": item.appointment_type,
+                "reason": item.reason,
+                "status": item.status,
+            }
+            for item in recent_appointments
+        ],
+        "can_open_profile": can_open_profile,
+        "can_message": can_message,
+    }
+
+
+@app.get("/api/exports/patients/{patient_email}/summary")
+async def export_patient_clinical_summary(
+    patient_email: str,
+    export_format: str = Query("csv", pattern="^(csv|json)$"),
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Export a minimum-necessary longitudinal summary after role authorization."""
+    if current_user.role == "patient":
+        if patient_email != current_user.email:
+            raise HTTPException(status_code=403, detail="You can export only your own summary")
+    elif current_user.role == "clinician":
+        connection = db.query(MessageRequestModel).filter(
+            MessageRequestModel.patient_email == patient_email,
+            MessageRequestModel.clinician_email == current_user.email,
+            MessageRequestModel.status == "accepted",
+        ).first()
+        if not connection:
+            raise HTTPException(
+                status_code=403,
+                detail="You can export summaries only for connected patients",
+            )
+    elif current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Not authorized to export clinical data")
+
+    patient = db.query(PatientModel).filter(
+        PatientModel.email == patient_email
+    ).first()
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
+    records = db.query(RecordModel).filter(
+        RecordModel.patient_email == patient_email
+    ).order_by(RecordModel.uploaded_at.desc()).all()
+    prescription_rows = db.execute(
+        text(
+            "SELECT * FROM prescriptions "
+            "WHERE patient_email=:email ORDER BY created_at DESC"
+        ),
+        {"email": patient_email},
+    ).mappings().all()
+    prescriptions = [
+        _row_to_prescription_response(dict(row), db) for row in prescription_rows
+    ]
+    appointments = db.query(AppointmentModel).filter(
+        AppointmentModel.patient_email == patient_email
+    ).order_by(
+        AppointmentModel.appointment_date.desc(),
+        AppointmentModel.appointment_time.desc(),
+    ).all()
+    history = db.query(PatientProfileHistoryModel).filter(
+        PatientProfileHistoryModel.patient_id == patient.id
+    ).order_by(PatientProfileHistoryModel.recorded_at.desc()).all()
+
+    payload = {
+        "exported_at": datetime.utcnow().isoformat(),
+        "exported_by": current_user.email,
+        "patient": _patient_profile_payload(patient),
+        "records": [
+            {
+                "id": item.id,
+                "name": item.name,
+                "type": item.type,
+                "category": item.category,
+                "source_date": getattr(item, "source_date", None),
+                "uploaded_at": item.uploaded_at.isoformat() if item.uploaded_at else None,
+                "analysis_summary": item.analysis_summary,
+                "key_findings": _safe_json_loads(item.key_findings, []),
+            }
+            for item in records
+        ],
+        "prescriptions": prescriptions,
+        "appointments": [
+            {
+                "id": item.id,
+                "date": item.appointment_date,
+                "time": item.appointment_time,
+                "clinician_email": item.clinician_email,
+                "type": item.appointment_type,
+                "reason": item.reason,
+                "status": item.status,
+                "notes": item.notes,
+            }
+            for item in appointments
+        ],
+        "measurement_history": [_history_payload(item) for item in history],
+        "disclaimer": (
+            "This export is a clinical summary and may not represent the complete "
+            "legal medical record."
+        ),
+    }
+
+    safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", patient_email).strip("_")
+    if export_format == "json":
+        return Response(
+            content=json.dumps(payload, ensure_ascii=False, indent=2),
+            media_type="application/json",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="{safe_name}_clinical_summary.json"'
+                )
+            },
+        )
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["CareConnect Clinical Summary"])
+    writer.writerow(["Patient", patient.name])
+    writer.writerow(["Email", patient.email])
+    writer.writerow(["Exported at", payload["exported_at"]])
+    writer.writerow([])
+    writer.writerow(["Section", "Date", "Item", "Status", "Details"])
+    for record in payload["records"]:
+        writer.writerow(
+            [
+                "Medical Record",
+                record["source_date"] or record["uploaded_at"] or "",
+                record["name"],
+                record["category"],
+                record["analysis_summary"] or "",
+            ]
+        )
+    for prescription in prescriptions:
+        medicine_names = ", ".join(
+            item.get("medicine_name", "")
+            for item in prescription.get("medicines", [])
+        )
+        writer.writerow(
+            [
+                "Prescription",
+                prescription.get("created_at") or "",
+                medicine_names,
+                prescription.get("status") or "",
+                prescription.get("diagnosis") or "",
+            ]
+        )
+    for appointment in payload["appointments"]:
+        writer.writerow(
+            [
+                "Appointment",
+                f'{appointment["date"]} {appointment["time"]}',
+                appointment["type"],
+                appointment["status"],
+                appointment["reason"],
+            ]
+        )
+    for measurement in payload["measurement_history"]:
+        writer.writerow(
+            [
+                "Measurement",
+                measurement.get("recorded_at") or "",
+                "Body composition and vitals",
+                measurement.get("status") or "",
+                (
+                    f'Weight {measurement.get("weight_kg") or "N/A"} kg; '
+                    f'BMI {measurement.get("bmi") or "N/A"}; '
+                    f'BP {measurement.get("systolic_bp") or "N/A"}/'
+                    f'{measurement.get("diastolic_bp") or "N/A"}'
+                ),
+            ]
+        )
+
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{safe_name}_clinical_summary.csv"'
+            )
+        },
+    )
+
+
 @app.get("/api/stats")
 async def get_stats(db: Session = Depends(get_db), current_user = Depends(get_current_user)):
     if current_user.role != "admin":
@@ -4687,12 +6946,16 @@ async def get_stats(db: Session = Depends(get_db), current_user = Depends(get_cu
     total_clinicians = db.query(ClinicianModel).count()
     total_admins = db.query(AdminModel).count()
     total_users = total_patients + total_clinicians + total_admins
+    active_sessions = db.query(UserSessionModel).filter(
+        UserSessionModel.revoked_at.is_(None),
+        UserSessionModel.expires_at > datetime.utcnow(),
+    ).count()
     
     return {
         "total_users": total_users,
         "total_patients": total_patients,
         "total_clinicians": total_clinicians,
-        "active_sessions": 342
+        "active_sessions": active_sessions
     }
 
 # ================== RECORD UPLOAD & ANALYSIS ==================
@@ -4701,31 +6964,55 @@ async def upload_record(
     file: UploadFile = File(...),
     category: str = Form(...),
     record_type: str = Form(...),
+    category_code: Optional[str] = Form(None),
+    tags: Optional[str] = Form(None),
+    source_date: Optional[str] = Form(None),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user)
 ):
+    if current_user.role != "patient":
+        raise HTTPException(status_code=403, detail="Only patients can upload medical records")
+
+    stored_path = None
     try:
-        folder = f"uploads/{current_user.email}"
-        os.makedirs(folder, exist_ok=True)
+        normalized_code, normalized_label = normalize_category(category_code or category)
+        normalized_tags = normalize_tags(tags)
+        normalized_source_date = parse_iso_date(source_date, "Source date")
+        clean_record_type = re.sub(r"\s+", " ", record_type or "").strip()
+        if not clean_record_type or len(clean_record_type) > 100:
+            raise HTTPException(
+                status_code=400,
+                detail="Record type is required and must be 100 characters or fewer",
+            )
 
-        file_path = os.path.join(folder, file.filename)
-
-        with open(file_path, "wb") as f:
-            content = await file.read()
-            f.write(content)
+        original_name, extension, mime_type, content = await read_validated_upload(
+            file,
+            allowed_extensions=MEDICAL_UPLOAD_EXTENSIONS,
+            max_bytes=MEDICAL_UPLOAD_MAX_BYTES,
+        )
+        stored_path = store_upload(
+            content=content,
+            storage_root=UPLOAD_STORAGE_ROOT,
+            purpose="medical-records",
+            owner_key=current_user.email,
+            extension=extension,
+        )
 
         # ✅ THIS IS THE MOST IMPORTANT LINE
         analysis = medical_analyzer.analyze_record(
-            file_path,
-            os.path.splitext(file.filename)[1]
+            str(stored_path),
+            extension,
         )
 
         new_record = RecordModel(
             patient_email=current_user.email,
-            type=record_type,
-            name=file.filename,
-            category=category,
-            file_path=file_path,
+            type=clean_record_type,
+            name=original_name,
+            category=normalized_label,
+            category_code=normalized_code,
+            tags=json.dumps(normalized_tags),
+            source_date=normalized_source_date,
+            file_path=str(stored_path),
             uploaded_by=current_user.email,
             analysis_summary=analysis["summary"],
             extracted_text=analysis["text_extracted"][:5000],
@@ -4734,7 +7021,7 @@ async def upload_record(
         )
 
         db.add(new_record)
-        db.commit()
+        db.flush()
         db.refresh(new_record)
 
         create_record_version(
@@ -4742,10 +7029,10 @@ async def upload_record(
             record_id=new_record.id,
             patient_email=new_record.patient_email,
             uploaded_by=current_user.email,
-            file_name=file.filename,
+            file_name=original_name,
             file_path=new_record.file_path,
-            file_type=file.content_type,
-            file_size=len(content) if "content" in locals() else None,
+            file_type=mime_type,
+            file_size=len(content),
             change_notes="Initial upload",
             analysis_summary=new_record.analysis_summary,
             extracted_text=new_record.extracted_text,
@@ -4755,25 +7042,40 @@ async def upload_record(
 
         # ── RAG: index the extracted text so the chatbot can retrieve it ──
         if analysis.get("text_extracted"):
-            index_record(
-                patient_email=current_user.email,
-                record_id=new_record.id,
-                record_name=new_record.name,
-                record_type=new_record.type,
-                record_date=new_record.uploaded_at.strftime("%Y-%m-%d"),
-                text=analysis["text_extracted"],
-            )
+            try:
+                index_record(
+                    patient_email=current_user.email,
+                    record_id=new_record.id,
+                    record_name=new_record.name,
+                    record_type=new_record.type,
+                    record_date=new_record.uploaded_at.strftime("%Y-%m-%d"),
+                    text=analysis["text_extracted"],
+                )
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "Record %s was saved but RAG indexing failed",
+                    new_record.id,
+                )
 
         return {
             "id": new_record.id,
             "name": new_record.name,
             "category": new_record.category,
+            "category_code": new_record.category_code,
+            "tags": normalized_tags,
             "summary": analysis["summary"]
         }
 
+    except HTTPException:
+        if stored_path and os.path.exists(stored_path):
+            os.remove(stored_path)
+        raise
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        if stored_path and os.path.exists(stored_path):
+            os.remove(stored_path)
+        logging.getLogger(__name__).exception("Medical record upload failed")
+        raise HTTPException(status_code=500, detail="Medical record upload failed") from e
 
 
 @app.post("/api/records/analyze")
@@ -5163,14 +7465,16 @@ async def get_record_details(
         raise HTTPException(status_code=404, detail="Record not found")
     
     # Check authorization
-    if current_user.role == "patient" and record.patient_email != current_user.email:
-        raise HTTPException(status_code=403, detail="Not authorized to view this record")
+    require_patient_access(db, current_user, record.patient_email)
     
     return {
         "id": record.id,
         "name": record.name,
         "type": record.type,
         "category": record.category,
+        "category_code": getattr(record, "category_code", "other") or "other",
+        "tags": _safe_json_loads(getattr(record, "tags", None), []),
+        "source_date": getattr(record, "source_date", None),
         "uploaded_at": record.uploaded_at.isoformat(),
         "analysis": {
             "summary": record.analysis_summary or "No analysis available",
@@ -5620,38 +7924,6 @@ async def patient_chatbot(
     except Exception as e:
         print(f"Chatbot error: {e}")
         raise HTTPException(status_code=500, detail=f"Chatbot error: {str(e)}")
-
-
-@app.delete("/api/records/{record_id}")
-async def delete_record(
-    record_id: int,
-    db: Session = Depends(get_db),
-    current_user = Depends(get_current_user)
-):
-    record = db.query(RecordModel).filter(
-        RecordModel.id == record_id
-    ).first()
-
-    if not record:
-        raise HTTPException(status_code=404, detail="Record not found")
-
-    # Authorization check
-    if current_user.role == "patient":
-        if record.patient_email != current_user.email:
-            raise HTTPException(status_code=403, detail="Not authorized to delete this record")
-
-    # Remove from RAG vector store before deleting from DB
-    delete_record_chunks(record.patient_email, record.id)
-
-    # Optional: delete file from disk
-    if record.file_path and os.path.exists(record.file_path):
-        os.remove(record.file_path)
-
-    db.delete(record)
-    db.commit()
-
-    return {"message": "Record deleted successfully"}
-
 
 
 # ================== ADMIN: RAG REINDEX ==================

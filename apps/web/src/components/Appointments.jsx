@@ -3,6 +3,8 @@ import axios from "axios";
 import { Calendar, dateFnsLocalizer } from "react-big-calendar";
 import { format, parse, startOfWeek, getDay } from "date-fns";
 import "react-big-calendar/lib/css/react-big-calendar.css";
+import VideoConsultationButton from "./VideoConsultationButton";
+import AppointmentDetailsDrawer from "./AppointmentDetailsDrawer";
 
 import enUS from "date-fns/locale/en-US";
 
@@ -21,7 +23,35 @@ const localizer = dateFnsLocalizer({
 const WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
 const emptyHours = () => Object.fromEntries(WEEKDAYS.map((day) => [day, []]));
 
-const Appointments = ({ user }) => {
+const calendarTypeIcons = {
+  phone_call: "fa-phone",
+  video_call: "fa-video",
+  in_person: "fa-hospital-user",
+};
+
+const AppointmentCalendarEvent = ({ event }) => (
+  <div
+    className="flex min-w-0 items-center gap-1.5 font-semibold"
+    title={event.title}
+  >
+    <i
+      className={`fas ${
+        calendarTypeIcons[event.appointment.appointment_type] ||
+        "fa-calendar-check"
+      } shrink-0 text-[11px]`}
+    ></i>
+    <span className="shrink-0 text-[11px]">
+      {format(event.start, "p")}
+    </span>
+    <span className="truncate">{event.displayName}</span>
+  </div>
+);
+
+const Appointments = ({
+  user,
+  onOpenPatientProfile,
+  onMessagePatient,
+}) => {
   const [appointments, setAppointments] = useState([]);
   const [clinicians, setClinicians] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -42,7 +72,15 @@ const Appointments = ({ user }) => {
   });
 
   const [notesByAppointment, setNotesByAppointment] = useState({});
-   const calendarEvents = appointments.map((appointment) => {
+  const [selectedAppointment, setSelectedAppointment] = useState(null);
+  const [patientSummaryState, setPatientSummaryState] = useState({
+    appointmentId: null,
+    data: null,
+    loading: false,
+    error: "",
+  });
+
+  const calendarEvents = appointments.map((appointment) => {
       const startDate = new Date(
         `${appointment.appointment_date}T${appointment.appointment_time}`,
       );
@@ -54,6 +92,10 @@ const Appointments = ({ user }) => {
 
       return {
         id: appointment.id,
+        displayName:
+          user?.role === "patient"
+            ? `Dr. ${appointment.clinician_name}`
+            : appointment.patient_name,
         title:
           user?.role === "patient"
             ? `Dr. ${appointment.clinician_name} - ${appointment.reason}`
@@ -78,7 +120,25 @@ const Appointments = ({ user }) => {
     try {
       setLoading(true);
       const res = await axios.get("/api/appointments");
-      setAppointments(res.data.appointments || []);
+      const nextAppointments = res.data.appointments || [];
+      setAppointments(nextAppointments);
+      setNotesByAppointment((current) => {
+        const nextNotes = { ...current };
+        nextAppointments.forEach((appointment) => {
+          if (nextNotes[appointment.id] === undefined) {
+            nextNotes[appointment.id] = appointment.notes || "";
+          }
+        });
+        return nextNotes;
+      });
+      setSelectedAppointment((current) => {
+        if (!current) return null;
+        return (
+          nextAppointments.find(
+            (appointment) => appointment.id === current.id,
+          ) || null
+        );
+      });
     } catch (err) {
       setError(err.response?.data?.detail || "Failed to load appointments");
     } finally {
@@ -112,6 +172,20 @@ const Appointments = ({ user }) => {
     loadClinicians();
     loadAvailability();
   }, [user?.role]);
+
+  useEffect(() => {
+    if (!selectedAppointment) return undefined;
+    const previousOverflow = document.body.style.overflow;
+    const closeOnEscape = (event) => {
+      if (event.key === "Escape") setSelectedAppointment(null);
+    };
+    document.body.style.overflow = "hidden";
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [selectedAppointment]);
 
   useEffect(() => {
     if (user?.role !== "patient" || !formData.clinician_email || !formData.appointment_date) {
@@ -234,7 +308,10 @@ const Appointments = ({ user }) => {
         `/api/appointments/${appointmentId}/status`,
         {
           status,
-          notes: notesByAppointment[appointmentId] || "",
+          notes:
+            notesByAppointment[appointmentId] ??
+            appointments.find((item) => item.id === appointmentId)?.notes ??
+            "",
         },
       );
 
@@ -244,6 +321,76 @@ const Appointments = ({ user }) => {
       setError(err.response?.data?.detail || "Failed to update appointment");
     } finally {
       setLoading(false);
+    }
+  };
+
+  const saveAppointmentNotes = async (appointmentId) => {
+    setMessage("");
+    setError("");
+    try {
+      setLoading(true);
+      await axios.put(`/api/appointments/${appointmentId}/notes`, {
+        notes: notesByAppointment[appointmentId] || "",
+      });
+      setMessage("Appointment notes saved successfully");
+      await loadAppointments();
+    } catch (err) {
+      setError(err.response?.data?.detail || "Failed to save appointment notes");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const openAppointmentDetails = (appointment) => {
+    setMessage("");
+    setError("");
+    setNotesByAppointment((current) => ({
+      ...current,
+      [appointment.id]:
+        current[appointment.id] ?? appointment.notes ?? "",
+    }));
+    setSelectedAppointment(appointment);
+    if (["clinician", "admin"].includes(user?.role)) {
+      setPatientSummaryState({
+        appointmentId: appointment.id,
+        data: null,
+        loading: true,
+        error: "",
+      });
+      axios
+        .get(
+          `/api/patients/${encodeURIComponent(
+            appointment.patient_email,
+          )}/appointment-summary`,
+          { params: { appointment_id: appointment.id } },
+        )
+        .then((response) => {
+          setPatientSummaryState((current) =>
+            current.appointmentId === appointment.id
+              ? { ...current, data: response.data, loading: false }
+              : current,
+          );
+        })
+        .catch((err) => {
+          setPatientSummaryState((current) =>
+            current.appointmentId === appointment.id
+              ? {
+                  ...current,
+                  loading: false,
+                  error:
+                    err.response?.data?.detail ||
+                    "Unable to load the patient summary.",
+                }
+              : current,
+          );
+        });
+    } else {
+      setPatientSummaryState({
+        appointmentId: null,
+        data: null,
+        loading: false,
+        error: "",
+      });
     }
   };
 
@@ -262,6 +409,9 @@ const Appointments = ({ user }) => {
         `/api/appointments/${appointmentId}`,
       );
       setMessage("Appointment deleted successfully");
+      setSelectedAppointment((current) =>
+        current?.id === appointmentId ? null : current,
+      );
       await loadAppointments();
     } catch (err) {
       setError(err.response?.data?.detail || "Failed to delete appointment");
@@ -288,9 +438,17 @@ const Appointments = ({ user }) => {
         backgroundColor,
         borderRadius: "8px",
         color: "white",
-        border: "none",
+        border:
+          selectedAppointment?.id === event.id
+            ? "2px solid #172554"
+            : "none",
         padding: "4px",
         fontSize: "13px",
+        cursor: "pointer",
+        boxShadow:
+          selectedAppointment?.id === event.id
+            ? "0 0 0 3px rgba(59, 130, 246, 0.25)"
+            : "none",
       },
     };
   };
@@ -428,6 +586,13 @@ const Appointments = ({ user }) => {
                   <option value="video_call">Video Call</option>
                   <option value="in_person">In Person</option>
                 </select>
+                {formData.appointment_type === "video_call" && (
+                  <p className="mt-2 text-sm leading-5 text-violet-700">
+                    Video visits open in Comm360 after approval. Each
+                    participant reviews the external-service consent before
+                    joining.
+                  </p>
+                )}
               </div>
             </div>
 
@@ -458,9 +623,14 @@ const Appointments = ({ user }) => {
       )}
       <div className="bg-white rounded-xl shadow-md border border-gray-100 p-6">
         <div className="flex items-center justify-between mb-6">
-          <h3 className="text-xl font-bold text-gray-800">
-            Appointment Calendar
-          </h3>
+          <div>
+            <h3 className="text-xl font-bold text-gray-800">
+              Appointment Calendar
+            </h3>
+            <p className="mt-1 text-sm text-gray-500">
+              Select any appointment to open its complete details and actions.
+            </p>
+          </div>
 
           <div className="flex items-center gap-3 text-sm">
             <span className="flex items-center gap-1">
@@ -492,15 +662,13 @@ const Appointments = ({ user }) => {
             defaultView="month"
             popup
             eventPropGetter={eventStyleGetter}
-            onSelectEvent={(event) => {
-              alert(
-                `Appointment Details\n\n` +
-                  `Reason: ${event.appointment.reason}\n` +
-                  `Status: ${event.appointment.status}\n` +
-                  `Date: ${event.appointment.appointment_date}\n` +
-                  `Time: ${event.appointment.appointment_time}`,
-              );
-            }}
+            components={{ event: AppointmentCalendarEvent }}
+            tooltipAccessor={(event) =>
+              `${event.displayName} · ${event.appointment.reason} · ${event.appointment.status}`
+            }
+            onSelectEvent={(event) =>
+              openAppointmentDetails(event.appointment)
+            }
           />
         </div>
       </div>
@@ -609,22 +777,35 @@ const Appointments = ({ user }) => {
 
                     <td className="px-6 py-4">
                       {user?.role === "clinician" || user?.role === "admin" ? (
-                        <textarea
-                          rows="2"
-                          value={
-                            notesByAppointment[appointment.id] ??
-                            appointment.notes ??
-                            ""
-                          }
-                          onChange={(e) =>
-                            setNotesByAppointment((prev) => ({
-                              ...prev,
-                              [appointment.id]: e.target.value,
-                            }))
-                          }
-                          placeholder="Add notes"
-                          className="w-48 px-3 py-2 border border-gray-300 rounded-lg text-sm"
-                        />
+                        <div>
+                          <textarea
+                            rows="2"
+                            value={
+                              notesByAppointment[appointment.id] ??
+                              appointment.notes ??
+                              ""
+                            }
+                            onChange={(e) =>
+                              setNotesByAppointment((prev) => ({
+                                ...prev,
+                                [appointment.id]: e.target.value,
+                              }))
+                            }
+                            placeholder="Add notes"
+                            className="w-48 px-3 py-2 border border-gray-300 rounded-lg text-sm"
+                          />
+                          <button
+                            type="button"
+                            onClick={() =>
+                              saveAppointmentNotes(appointment.id)
+                            }
+                            disabled={loading}
+                            className="mt-1 block text-xs font-semibold text-blue-700 hover:text-blue-900 disabled:opacity-50"
+                          >
+                            <i className="fas fa-floppy-disk mr-1"></i>
+                            Save notes
+                          </button>
+                        </div>
                       ) : (
                         <span className="text-sm text-gray-600">
                           {appointment.notes || "No notes"}
@@ -634,6 +815,19 @@ const Appointments = ({ user }) => {
 
                     <td className="px-6 py-4">
                       <div className="flex flex-wrap gap-2">
+                        <button
+                          type="button"
+                          onClick={() => openAppointmentDetails(appointment)}
+                          className="rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-sm font-semibold text-blue-700 hover:bg-blue-100"
+                        >
+                          <i className="fas fa-eye mr-2"></i>
+                          Details
+                        </button>
+
+                        {["patient", "clinician"].includes(user?.role) && (
+                          <VideoConsultationButton appointment={appointment} />
+                        )}
+
                         {user?.role === "clinician" &&
                           appointment.status === "pending" && (
                             <>
@@ -756,6 +950,67 @@ const Appointments = ({ user }) => {
           </div>
         )}
       </div>
+
+      <AppointmentDetailsDrawer
+        appointment={selectedAppointment}
+        user={user}
+        message={message}
+        error={error}
+        patientSummary={
+          patientSummaryState.appointmentId === selectedAppointment?.id
+            ? patientSummaryState.data
+            : null
+        }
+        patientSummaryLoading={
+          patientSummaryState.appointmentId === selectedAppointment?.id &&
+          patientSummaryState.loading
+        }
+        patientSummaryError={
+          patientSummaryState.appointmentId === selectedAppointment?.id
+            ? patientSummaryState.error
+            : ""
+        }
+        notes={
+          selectedAppointment
+            ? notesByAppointment[selectedAppointment.id] ??
+              selectedAppointment.notes ??
+              ""
+            : ""
+        }
+        busy={loading}
+        onClose={() => setSelectedAppointment(null)}
+        onNotesChange={(notes) =>
+          setNotesByAppointment((current) => ({
+            ...current,
+            [selectedAppointment.id]: notes,
+          }))
+        }
+        onSaveNotes={() => saveAppointmentNotes(selectedAppointment.id)}
+        onStatusChange={(status) =>
+          updateAppointmentStatus(selectedAppointment.id, status)
+        }
+        onDelete={() => deleteAppointment(selectedAppointment.id)}
+        onOpenPatientProfile={() => {
+          const patient = {
+            id: patientSummaryState.data?.patient?.id,
+            email: selectedAppointment.patient_email,
+            name: selectedAppointment.patient_name,
+            canExport:
+              user?.role === "admin" ||
+              Boolean(patientSummaryState.data?.can_message),
+          };
+          setSelectedAppointment(null);
+          onOpenPatientProfile?.(patient);
+        }}
+        onMessagePatient={() => {
+          const patient = {
+            email: selectedAppointment.patient_email,
+            name: selectedAppointment.patient_name,
+          };
+          setSelectedAppointment(null);
+          onMessagePatient?.(patient);
+        }}
+      />
     </div>
   );
 };

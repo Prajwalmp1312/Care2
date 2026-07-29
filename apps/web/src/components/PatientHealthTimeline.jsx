@@ -84,7 +84,12 @@ const formatStatus = (value) => {
     .replace(/\b\w/g, (char) => char.toUpperCase());
 };
 
-const PatientHealthTimeline = ({ patientEmail = null, compact = false }) => {
+const PatientHealthTimeline = ({
+  patientEmail = null,
+  compact = false,
+  recentLimit = 4,
+  onViewAll,
+}) => {
   const [timelineData, setTimelineData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [selectedType, setSelectedType] = useState("all");
@@ -117,30 +122,6 @@ const PatientHealthTimeline = ({ patientEmail = null, compact = false }) => {
       setLoading(false);
     }
   };
-
-  const deleteEmergencyAlert = async (alertId) => {
-  const confirmDelete = window.confirm(
-    "Are you sure you want to delete this emergency alert?"
-  );
-
-  if (!confirmDelete) return;
-
-  try {
-    const token = localStorage.getItem("access_token");
-
-    await axios.delete(`${API_BASE_URL}/api/emergency-alerts/${alertId}`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
-    });
-
-    alert("Emergency alert deleted successfully.");
-    loadTimeline();
-  } catch (err) {
-    console.error("Emergency alert delete failed:", err.response?.data || err);
-    alert(err.response?.data?.detail || "Failed to delete emergency alert.");
-  }
-};
 
   useEffect(() => {
     loadTimeline();
@@ -180,18 +161,25 @@ const PatientHealthTimeline = ({ patientEmail = null, compact = false }) => {
             if (
               value === null ||
               value === undefined ||
-              value === "" ||
-              typeof value === "object"
+              value === ""
             ) {
               return null;
             }
+
+            const displayValue = Array.isArray(value)
+              ? value.join(", ")
+              : typeof value === "object"
+                ? JSON.stringify(value)
+                : String(value);
+
+            if (!displayValue) return null;
 
             return (
               <div key={key} className="text-sm">
                 <span className="font-semibold text-gray-600">
                   {formatStatus(key)}:
                 </span>{" "}
-                <span className="text-gray-700">{String(value)}</span>
+                <span className="text-gray-700">{displayValue}</span>
               </div>
             );
           })}
@@ -251,33 +239,17 @@ const PatientHealthTimeline = ({ patientEmail = null, compact = false }) => {
               </p>
             </div>
 
-            <div className="flex items-center gap-2">
-              {item.event_type === "emergency_alert" &&
-                item.metadata?.alert_id && (
-                  <button
-                    onClick={() => deleteEmergencyAlert(item.metadata.alert_id)}
-                    className="bg-red-100 hover:bg-red-200 text-red-700 px-3 py-2 rounded-lg text-sm font-semibold transition"
-                    title="Delete emergency alert"
-                  >
-                    <i className="fas fa-trash mr-1"></i>
-                    Delete
-                  </button>
-                )}
-
-                <button
-                  onClick={() =>
-                    setExpandedEventId(isExpanded ? null : item.id)
-                  }
-                  className="text-gray-500 hover:text-blue-600 transition"
-                  title="View details"
-                >
-                  <i
-                    className={`fas ${
-                      isExpanded ? "fa-chevron-up" : "fa-chevron-down"
-                    }`}
-                  ></i>
-                </button>
-            </div>
+            <button
+              onClick={() => setExpandedEventId(isExpanded ? null : item.id)}
+              className="text-gray-500 hover:text-blue-600 transition"
+              title="View details"
+            >
+              <i
+                className={`fas ${
+                  isExpanded ? "fa-chevron-up" : "fa-chevron-down"
+                }`}
+              ></i>
+            </button>
           </div>
 
           {isExpanded && renderMetadata(item.metadata)}
@@ -288,10 +260,91 @@ const PatientHealthTimeline = ({ patientEmail = null, compact = false }) => {
 
   if (loading) {
     return (
-      <div className="bg-white rounded-xl shadow-lg border border-gray-100 p-10 text-center">
+      <div
+        className={`bg-white rounded-xl shadow-lg border border-gray-100 text-center ${
+          compact ? "p-6" : "p-10"
+        }`}
+      >
         <i className="fas fa-spinner fa-spin text-blue-600 text-3xl mb-4"></i>
-        <p className="text-gray-600">Loading patient health timeline...</p>
+        <p className="text-gray-600">
+          {compact ? "Loading recent activity..." : "Loading patient health timeline..."}
+        </p>
       </div>
+    );
+  }
+
+  if (compact) {
+    const recentItems = (timelineData?.timeline || []).slice(0, recentLimit);
+
+    return (
+      <section className="h-full rounded-xl border border-gray-100 bg-white p-5 shadow-lg">
+        <div className="mb-4 flex items-start justify-between gap-3">
+          <div>
+            <h3 className="flex items-center gap-2 text-lg font-bold text-gray-800">
+              <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-indigo-100 text-indigo-600">
+                <i className="fas fa-timeline"></i>
+              </span>
+              Recent Timeline
+            </h3>
+            <p className="mt-1 text-sm text-gray-500">
+              Your latest clinical activity at a glance.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onViewAll}
+            className="shrink-0 rounded-lg px-3 py-2 text-sm font-semibold text-indigo-600 hover:bg-indigo-50"
+          >
+            Complete timeline
+            <i className="fas fa-arrow-up-right-from-square ml-2 text-xs"></i>
+          </button>
+        </div>
+
+        {error && (
+          <div className="mb-3 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+            {error}
+          </div>
+        )}
+
+        <div className="space-y-2">
+          {recentItems.map((item) => {
+            const colors = colorClasses[item.color] || colorClasses.gray;
+            return (
+              <div
+                key={item.id}
+                className="flex items-center gap-3 rounded-lg border border-gray-100 p-3"
+              >
+                <span
+                  className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full ${colors.bg} ${colors.text}`}
+                >
+                  <i className={`fas ${item.icon || "fa-circle"} text-sm`}></i>
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-sm font-bold text-gray-800">
+                    {item.title}
+                  </span>
+                  <span className="block truncate text-xs text-gray-500">
+                    {formatStatus(item.category)} • {formatDateTime(item.date)}
+                  </span>
+                </span>
+                {item.status && (
+                  <span
+                    className={`hidden rounded-full px-2 py-1 text-xs font-semibold sm:inline ${colors.bg} ${colors.text}`}
+                  >
+                    {formatStatus(item.status)}
+                  </span>
+                )}
+              </div>
+            );
+          })}
+
+          {!recentItems.length && !error && (
+            <div className="rounded-lg bg-gray-50 py-6 text-center text-sm text-gray-500">
+              No timeline activity yet.
+            </div>
+          )}
+        </div>
+      </section>
     );
   }
 

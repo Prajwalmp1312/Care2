@@ -38,9 +38,6 @@ export const AuthProvider = ({ children }) => {
         const token = localStorage.getItem('access_token');
         if (token) {
           config.headers.Authorization = `Bearer ${token}`;
-          console.log('🔐 Adding auth token to request:', config.url);
-        } else {
-          console.warn('⚠️ No token found for request:', config.url);
         }
         return config;
       },
@@ -75,32 +72,35 @@ export const AuthProvider = ({ children }) => {
   }, []);
 
   useEffect(() => {
-    // Check if user is logged in on mount
-    const token = localStorage.getItem('access_token');
-    const storedUser = localStorage.getItem('user');
-    
-    console.log('🔍 Checking stored credentials...');
-    console.log('Token exists:', !!token);
-    console.log('User exists:', !!storedUser);
-    
-    if (token && storedUser) {
+    const restoreSession = async () => {
+      const token = localStorage.getItem('access_token');
+      const storedUser = localStorage.getItem('user');
+
+      if (!token || !storedUser) {
+        setLoading(false);
+        return;
+      }
+
       try {
-        const parsedUser = JSON.parse(storedUser);
-        setUser(parsedUser);
-        console.log('✅ User restored from storage:', parsedUser.email);
+        JSON.parse(storedUser);
+        const response = await axios.get('/api/auth/me');
+        localStorage.setItem('user', JSON.stringify(response.data));
+        setUser(response.data);
       } catch (error) {
-        console.error('❌ Error parsing stored user:', error);
         localStorage.removeItem('access_token');
         localStorage.removeItem('user');
+        localStorage.removeItem('mealPlannerToken');
+        localStorage.removeItem('mealPlannerUser');
+        setUser(null);
+      } finally {
+        setLoading(false);
       }
-    } else {
-      console.log('ℹ️ No stored credentials found');
-    }
-    setLoading(false);
+    };
+
+    restoreSession();
   }, []);
 
   const login = async (email, password) => {
-    console.log('🔐 Attempting login for:', email);
     try {
       const response = await axios.post('/api/auth/login', {
         email,
@@ -108,9 +108,6 @@ export const AuthProvider = ({ children }) => {
       });
       
       const { access_token, user: userData } = response.data;
-      
-      console.log('✅ Login successful:', userData.email);
-      console.log('Token received:', access_token.substring(0, 20) + '...');
       
       localStorage.setItem('access_token', access_token);
       localStorage.setItem('user', JSON.stringify(userData));
@@ -124,7 +121,6 @@ export const AuthProvider = ({ children }) => {
   };
 
   const register = async (name, email, password, role, gender,specialization,department,years_of_experience) => {
-    console.log('📝 Attempting registration for:', email, 'as', role);
     try {
       const response = await axios.post('/api/auth/register', {
         name,
@@ -137,12 +133,18 @@ export const AuthProvider = ({ children }) => {
         years_of_experience:years_of_experience ? Number(years_of_experience) : null
       });
 
-      console.log('✅ Registration successful:', email);
       return response.data;
     } catch (error) {
       console.error('❌ Registration failed:', error.response?.data || error.message);
       throw error;
     }
+  };
+
+  const completeExternalLogin = (accessToken, userData) => {
+    localStorage.setItem('access_token', accessToken);
+    localStorage.setItem('user', JSON.stringify(userData));
+    setUser(userData);
+    return userData;
   };
 
     // const verifyEmail = async (email, code) => {
@@ -161,7 +163,19 @@ export const AuthProvider = ({ children }) => {
  
 
   const logout = () => {
-    console.log('👋 Logging out...');
+    const token = localStorage.getItem('access_token');
+    if (token) {
+      axios.post(
+        '/api/auth/logout',
+        {},
+        {
+          headers: { Authorization: `Bearer ${token}` },
+          timeout: 3000,
+        },
+      ).catch(() => {
+        // Local sign-out still completes when the API is unavailable.
+      });
+    }
     localStorage.removeItem('access_token');
     localStorage.removeItem('user');
     localStorage.removeItem('mealPlannerToken');
@@ -172,6 +186,7 @@ export const AuthProvider = ({ children }) => {
   const value = {
     user,
     login,
+    completeExternalLogin,
     register,
     // verifyEmail,
     logout,
