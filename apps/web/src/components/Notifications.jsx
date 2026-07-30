@@ -8,7 +8,8 @@ const Notifications = () => {
   const dropdownRef = useRef(null);
 
   const getIcon = (type) => {
-    if (type === "appointment") return "fa-calendar-check";
+    if (["appointment", "appointment_reminder"].includes(type))
+      return type === "appointment_reminder" ? "fa-clock" : "fa-calendar-check";
     if (type === "prescription") return "fa-prescription-bottle-medical";
     if (type === "message") return "fa-comments";
     if (["alert", "emergency"].includes(type))
@@ -18,7 +19,8 @@ const Notifications = () => {
   };
 
   const getIconClasses = (type) => {
-    if (type === "appointment") return "bg-blue-100 text-blue-600";
+    if (["appointment", "appointment_reminder"].includes(type))
+      return "bg-blue-100 text-blue-600";
     if (type === "prescription") return "bg-purple-100 text-purple-600";
     if (type === "message") return "bg-green-100 text-green-600";
     if (["alert", "emergency"].includes(type))

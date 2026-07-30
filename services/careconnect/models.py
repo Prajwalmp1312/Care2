@@ -65,6 +65,7 @@ class Clinician(Base):
     department = Column(String(100))
     years_of_experience = Column(Integer)
     consultation_hours = Column(Text, nullable=True)
+    consultation_breaks = Column(Text, nullable=True)
     consultation_duration_minutes = Column(Integer, default=15)
     
     # Approval system fields (ADDED)
@@ -240,6 +241,38 @@ class Appointment(Base):
 
     created_at = Column(DateTime, default=utc_now)
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
+
+
+class AppointmentReminder(Base):
+    __tablename__ = "appointment_reminders"
+    __table_args__ = (
+        UniqueConstraint(
+            "appointment_id",
+            "reminder_type",
+            name="uq_appointment_reminder_type",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    appointment_id = Column(
+        Integer,
+        ForeignKey("appointments.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    patient_email = Column(String(100), nullable=False, index=True)
+    reminder_type = Column(String(20), nullable=False)
+    scheduled_for = Column(DateTime, nullable=False, index=True)
+    status = Column(String(20), nullable=False, default="scheduled", index=True)
+    sent_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
+    updated_at = Column(
+        DateTime,
+        default=utc_now,
+        onupdate=utc_now,
+        nullable=False,
+    )
+
 
 class ChatAttachment(Base):
     __tablename__ = "chat_attachments"

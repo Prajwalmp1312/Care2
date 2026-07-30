@@ -120,6 +120,7 @@ def ensure_existing_schema_columns():
             _add_column_if_missing(conn, "clinicians", "approved_at", "approved_at DATETIME NULL")
             _add_column_if_missing(conn, "clinicians", "rejection_reason", "rejection_reason TEXT NULL")
             _add_column_if_missing(conn, "clinicians", "consultation_hours", "consultation_hours TEXT NULL")
+            _add_column_if_missing(conn, "clinicians", "consultation_breaks", "consultation_breaks TEXT NULL")
             _add_column_if_missing(conn, "clinicians", "consultation_duration_minutes", "consultation_duration_minutes INT NOT NULL DEFAULT 15")
 
             # Message/file columns

@@ -32,7 +32,7 @@ import fitz  # PyMuPDF for reading PDF text
 from models import MessageRequest as MessageRequestModel
 from database import SessionLocal
 from database import get_db, init_db, get_user_by_email_and_role, email_exists
-from models import Patient as PatientModel, Clinician as ClinicianModel, Admin as AdminModel, Appointment as AppointmentModel, Prescription as PrescriptionModel, Notification as NotificationModel, MedicalRecordVersion as RecordVersionModel, PatientProfileHistory as PatientProfileHistoryModel, EmergencyAlert as EmergencyAlertModel, EmergencyAlertEvent as EmergencyAlertEventModel, UserConsent as UserConsentModel, VideoConsultationEvent as VideoConsultationEventModel, UserSession as UserSessionModel, SecurityAuditEvent as SecurityAuditEventModel
+from models import Patient as PatientModel, Clinician as ClinicianModel, Admin as AdminModel, Appointment as AppointmentModel, AppointmentReminder as AppointmentReminderModel, Prescription as PrescriptionModel, Notification as NotificationModel, MedicalRecordVersion as RecordVersionModel, PatientProfileHistory as PatientProfileHistoryModel, EmergencyAlert as EmergencyAlertModel, EmergencyAlertEvent as EmergencyAlertEventModel, UserConsent as UserConsentModel, VideoConsultationEvent as VideoConsultationEventModel, UserSession as UserSessionModel, SecurityAuditEvent as SecurityAuditEventModel
 from models import Message as MessageModel, MedicalRecord as RecordModel
 import mimetypes
 from fastapi.responses import FileResponse
@@ -370,8 +370,9 @@ app.add_middleware(
     max_age=3600,
 )
 
-# Initialize the database and the in-process escalation monitor on startup.
+# Initialize the database and the in-process operational monitors on startup.
 emergency_monitor_task = None
+appointment_reminder_task = None
 
 
 async def emergency_monitor_loop():
@@ -391,18 +392,38 @@ async def emergency_monitor_loop():
             monitor_db.close()
 
 
+async def appointment_reminder_loop():
+    while True:
+        monitor_db = SessionLocal()
+        try:
+            _deliver_due_appointment_reminders(monitor_db)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            monitor_db.rollback()
+            logging.getLogger(__name__).exception(
+                "Appointment reminder monitor failed"
+            )
+        finally:
+            monitor_db.close()
+        await asyncio.sleep(30)
+
+
 @app.on_event("startup")
 async def startup_event():
-    global emergency_monitor_task
+    global emergency_monitor_task, appointment_reminder_task
     init_db()
     ensure_prescription_multi_medicine_column()
     init_meal_planner_schema()
     emergency_monitor_task = asyncio.create_task(emergency_monitor_loop())
+    appointment_reminder_task = asyncio.create_task(
+        appointment_reminder_loop()
+    )
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global emergency_monitor_task
+    global emergency_monitor_task, appointment_reminder_task
     if emergency_monitor_task:
         emergency_monitor_task.cancel()
         try:
@@ -410,6 +431,13 @@ async def shutdown_event():
         except asyncio.CancelledError:
             pass
         emergency_monitor_task = None
+    if appointment_reminder_task:
+        appointment_reminder_task.cancel()
+        try:
+            await appointment_reminder_task
+        except asyncio.CancelledError:
+            pass
+        appointment_reminder_task = None
 
 # Pydantic Models
 class UserRegister(BaseModel):
@@ -471,6 +499,7 @@ class AppointmentNotesUpdate(BaseModel):
 
 class ClinicianAvailabilityUpdate(BaseModel):
     consultation_hours: Dict[str, List[Dict[str, str]]]
+    consultation_breaks: Optional[Dict[str, List[Dict[str, str]]]] = None
     consultation_duration_minutes: int = 15
 
 class PrescriptionMedicine(BaseModel):
@@ -548,7 +577,21 @@ class EmergencyAlertNoteRequest(BaseModel):
 class EmergencyAlertEscalationRequest(BaseModel):
     reason: str
 
+
+class EmergencyFalseAlarmRequest(BaseModel):
+    confirmed: bool
+
 # Helper Functions
+def utc_now_aware() -> datetime:
+    """Return a timezone-aware UTC timestamp for tokens and API metadata."""
+    return datetime.now(timezone.utc)
+
+
+def utc_now() -> datetime:
+    """Return UTC without tzinfo for existing MariaDB DATETIME columns."""
+    return utc_now_aware().replace(tzinfo=None)
+
+
 def _password_bytes(password: str) -> bytes:
     # bcrypt only uses the first 72 bytes. passlib truncated silently,
     # so we do the same to stay compatible with existing stored hashes.
@@ -569,10 +612,15 @@ def get_password_hash(password):
 
 def create_access_token(data: dict, *, jti: str, expires_at: datetime):
     to_encode = data.copy()
-    now = datetime.utcnow()
+    now = utc_now_aware()
+    token_expires_at = (
+        expires_at
+        if expires_at.tzinfo is not None
+        else expires_at.replace(tzinfo=timezone.utc)
+    )
     to_encode.update(
         {
-            "exp": expires_at,
+            "exp": token_expires_at,
             "iat": now,
             "nbf": now,
             "jti": jti,
@@ -584,9 +632,9 @@ def create_access_token(data: dict, *, jti: str, expires_at: datetime):
 
 
 def create_user_session_token(user, db: Session, request: Request) -> tuple[str, UserSessionModel]:
-    expires_at = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    expires_at = utc_now() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     jti = secrets.token_urlsafe(32)
-    now = datetime.utcnow()
+    now = utc_now()
 
     # Keep the active-session set bounded per account. Expired rows remain as
     # audit history; the oldest live session is revoked when the cap is reached.
@@ -633,7 +681,7 @@ def revoke_all_user_sessions(
         UserSessionModel.revoked_at.is_(None),
     ).update(
         {
-            UserSessionModel.revoked_at: datetime.utcnow(),
+            UserSessionModel.revoked_at: utc_now(),
             UserSessionModel.revoke_reason: reason[:255],
         },
         synchronize_session=False,
@@ -673,7 +721,7 @@ async def get_current_user(
         UserSessionModel.user_email == email,
         UserSessionModel.user_role == role,
     ).first()
-    now = datetime.utcnow()
+    now = utc_now()
     if (
         session is None
         or session.revoked_at is not None
@@ -852,7 +900,7 @@ async def accept_consent(
     ]:
         raise HTTPException(status_code=403, detail="Not a consultation participant")
 
-    now = datetime.utcnow()
+    now = utc_now()
     consent = db.query(UserConsentModel).filter(
         UserConsentModel.user_email == current_user.email,
         UserConsentModel.consent_type == consent_type,
@@ -896,7 +944,7 @@ async def revoke_consent(
     if not consent:
         return {"message": "No active consent was found"}
     consent.status = "revoked"
-    consent.revoked_at = datetime.utcnow()
+    consent.revoked_at = utc_now()
     db.commit()
     return {"message": "Consent revoked", "consent_type": consent_type}
 
@@ -1915,7 +1963,7 @@ async def approve_clinician_request(
         existing_clinician.approval_status = "approved"
         existing_clinician.is_active = True            # ✅ IMPORTANT
         existing_clinician.approved_by = current_user.email
-        existing_clinician.approved_at = datetime.utcnow()
+        existing_clinician.approved_at = utc_now()
 
         temp_password = None
         message = "Existing clinician approved and activated"
@@ -1938,7 +1986,7 @@ async def approve_clinician_request(
             approval_status="approved",
             is_active=True,                             # ✅ IMPORTANT
             approved_by=current_user.email,
-            approved_at=datetime.utcnow()
+            approved_at=utc_now()
         )
 
         db.add(new_clinician)
@@ -1947,7 +1995,7 @@ async def approve_clinician_request(
     # ✅ update join request
     request.status = "approved"
     request.reviewed_by = current_user.email
-    request.reviewed_at = datetime.utcnow()
+    request.reviewed_at = utc_now()
 
     # ✅ audit log
     audit_log = AuditLogModel(
@@ -1997,7 +2045,7 @@ async def reject_clinician_request(
     
     request.status = "rejected"
     request.reviewed_by = current_user.email
-    request.reviewed_at = datetime.utcnow()
+    request.reviewed_at = utc_now()
     request.rejection_reason = rejection_data.get("reason", "")
     
     # Create audit log
@@ -2090,7 +2138,7 @@ async def toggle_clinician_status(
     if clinician.is_active and clinician.approval_status != "approved":
         clinician.approval_status = "approved"
         clinician.approved_by = current_user.email
-        clinician.approved_at = datetime.utcnow()
+        clinician.approved_at = utc_now()
 
     action = "activated_clinician" if clinician.is_active else "deactivated_clinician"
 
@@ -2480,7 +2528,7 @@ async def get_admin_dashboard_stats(
     ).count()
     active_sessions = db.query(UserSessionModel).filter(
         UserSessionModel.revoked_at.is_(None),
-        UserSessionModel.expires_at > datetime.utcnow(),
+        UserSessionModel.expires_at > utc_now(),
     ).count()
     
     return {
@@ -2504,8 +2552,8 @@ async def get_role_dashboard_widgets(
     db: Session = Depends(get_db),
 ):
     """Return a compact, actionable queue tailored to the signed-in role."""
-    today = datetime.utcnow().date().isoformat()
-    thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+    today = utc_now().date().isoformat()
+    thirty_days_ago = utc_now() - timedelta(days=30)
 
     if current_user.role == "patient":
         upcoming = db.query(AppointmentModel).filter(
@@ -2633,7 +2681,7 @@ async def get_role_dashboard_widgets(
         ).count()
         active_sessions = db.query(UserSessionModel).filter(
             UserSessionModel.revoked_at.is_(None),
-            UserSessionModel.expires_at > datetime.utcnow(),
+            UserSessionModel.expires_at > utc_now(),
         ).count()
         pending_requests = db.query(JoinRequestModel).filter(
             JoinRequestModel.status == "pending",
@@ -2688,7 +2736,7 @@ async def get_admin_analytics(
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
 
-    start = datetime.utcnow() - timedelta(days=range_days - 1)
+    start = utc_now() - timedelta(days=range_days - 1)
     bucket_size = 1 if range_days <= 31 else 7 if range_days <= 180 else 30
     bucket_count = (range_days + bucket_size - 1) // bucket_size
     trends = []
@@ -2761,7 +2809,7 @@ async def get_admin_analytics(
 
     return {
         "range_days": range_days,
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": utc_now_aware().isoformat(),
         "totals": {
             "new_users": len(new_patients) + len(new_clinicians),
             "records": len(records),
@@ -2793,6 +2841,17 @@ def _consultation_hours(clinician) -> Dict[str, List[Dict[str, str]]]:
     except (TypeError, json.JSONDecodeError):
         return {day: [] for day in WEEKDAYS}
 
+
+def _consultation_breaks(clinician) -> Dict[str, List[Dict[str, str]]]:
+    try:
+        value = json.loads(
+            getattr(clinician, "consultation_breaks", "") or "{}"
+        )
+        return {day: value.get(day, []) for day in WEEKDAYS}
+    except (TypeError, json.JSONDecodeError):
+        return {day: [] for day in WEEKDAYS}
+
+
 def _validate_consultation_hours(hours: Dict[str, List[Dict[str, str]]]):
     unknown_days = set(hours) - set(WEEKDAYS)
     if unknown_days:
@@ -2818,13 +2877,98 @@ def _validate_consultation_hours(hours: Dict[str, List[Dict[str, str]]]):
             previous_end = end_time
     return normalized
 
+
+def _validate_consultation_breaks(
+    breaks: Dict[str, List[Dict[str, str]]],
+    consultation_hours: Dict[str, List[Dict[str, str]]],
+):
+    unknown_days = set(breaks) - set(WEEKDAYS)
+    if unknown_days:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid weekday: {sorted(unknown_days)[0]}",
+        )
+    normalized = {day: [] for day in WEEKDAYS}
+    for day in WEEKDAYS:
+        day_breaks = breaks.get(day, [])
+        if not isinstance(day_breaks, list):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Breaks for {day} must be a list",
+            )
+        previous_end = None
+        for interval in sorted(
+            day_breaks,
+            key=lambda item: item.get("start", ""),
+        ):
+            start = interval.get("start", "")
+            end = interval.get("end", "")
+            label = str(interval.get("label") or "Break").strip()[:50]
+            try:
+                start_time = datetime.strptime(start, "%H:%M").time()
+                end_time = datetime.strptime(end, "%H:%M").time()
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Use HH:MM times for {day} breaks",
+                )
+            if start_time >= end_time:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Break start must be before break end for {day}",
+                )
+            if previous_end and start_time < previous_end:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Breaks overlap on {day}",
+                )
+            contained = any(
+                start_time
+                >= datetime.strptime(window["start"], "%H:%M").time()
+                and end_time
+                <= datetime.strptime(window["end"], "%H:%M").time()
+                for window in consultation_hours.get(day, [])
+            )
+            if not contained:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"The {label.lower()} on {day} must be inside "
+                        "consultation hours"
+                    ),
+                )
+            normalized[day].append(
+                {
+                    "start": start,
+                    "end": end,
+                    "label": label or "Break",
+                }
+            )
+            previous_end = end_time
+    return normalized
+
+
+def _time_range_overlaps_break(
+    start_at: datetime,
+    end_at: datetime,
+    breaks: List[Dict[str, str]],
+) -> bool:
+    return any(
+        start_at.time() < datetime.strptime(item["end"], "%H:%M").time()
+        and end_at.time() > datetime.strptime(item["start"], "%H:%M").time()
+        for item in breaks
+    )
+
+
 @app.get("/api/clinician/availability")
 async def get_clinician_availability(current_user=Depends(get_current_user)):
     if current_user.role != "clinician":
         raise HTTPException(status_code=403, detail="Only clinicians can manage consultation hours")
     return {
         "consultation_hours": _consultation_hours(current_user),
+        "consultation_breaks": _consultation_breaks(current_user),
         "consultation_duration_minutes": getattr(current_user, "consultation_duration_minutes", 15) or 15,
+        "appointment_timezone": APPOINTMENT_TIMEZONE_NAME,
     }
 
 @app.put("/api/clinician/availability")
@@ -2838,13 +2982,22 @@ async def update_clinician_availability(
     if availability.consultation_duration_minutes not in {15, 30, 45, 60}:
         raise HTTPException(status_code=400, detail="Consultation duration must be 15, 30, 45, or 60 minutes")
     normalized = _validate_consultation_hours(availability.consultation_hours)
+    normalized_breaks = _validate_consultation_breaks(
+        availability.consultation_breaks
+        if availability.consultation_breaks is not None
+        else {day: [] for day in WEEKDAYS},
+        normalized,
+    )
     current_user.consultation_hours = json.dumps(normalized)
+    current_user.consultation_breaks = json.dumps(normalized_breaks)
     current_user.consultation_duration_minutes = availability.consultation_duration_minutes
     db.commit()
     return {
         "message": "Consultation hours updated successfully",
         "consultation_hours": normalized,
+        "consultation_breaks": normalized_breaks,
         "consultation_duration_minutes": availability.consultation_duration_minutes,
+        "appointment_timezone": APPOINTMENT_TIMEZONE_NAME,
     }
 
 # Update the existing get_all_clinicians endpoint to only show approved clinicians
@@ -2866,6 +3019,7 @@ async def get_all_clinicians(db: Session = Depends(get_db), current_user = Depen
                 "department": c.department,
                 "years_of_experience": c.years_of_experience,
                 "consultation_hours": _consultation_hours(c),
+                "consultation_breaks": _consultation_breaks(c),
                 "consultation_duration_minutes": getattr(c, "consultation_duration_minutes", 15) or 15,
             }
             for c in clinicians
@@ -2901,12 +3055,22 @@ async def get_available_consultation_slots(
         ).all()
     }
     slots = []
+    day_breaks = _consultation_breaks(clinician).get(day_name, [])
     for interval in _consultation_hours(clinician).get(day_name, []):
         cursor = datetime.combine(selected_date, datetime.strptime(interval["start"], "%H:%M").time())
         end = datetime.combine(selected_date, datetime.strptime(interval["end"], "%H:%M").time())
         while cursor + timedelta(minutes=duration) <= end:
             value = cursor.strftime("%H:%M")
-            if value not in booked and cursor > datetime.now():
+            slot_end = cursor + timedelta(minutes=duration)
+            if (
+                value not in booked
+                and cursor > datetime.now()
+                and not _time_range_overlaps_break(
+                    cursor,
+                    slot_end,
+                    day_breaks,
+                )
+            ):
                 slots.append(value)
             cursor += timedelta(minutes=duration)
     return {"date": date, "duration_minutes": duration, "slots": slots}
@@ -3345,7 +3509,7 @@ async def accept_message_request(
         raise HTTPException(status_code=404, detail="Request not found")
     
     request.status = "accepted"
-    request.responded_at = datetime.utcnow()
+    request.responded_at = utc_now()
     db.commit()
     
     return {"message": "Request accepted"}
@@ -3369,7 +3533,7 @@ async def reject_message_request(
         raise HTTPException(status_code=404, detail="Request not found")
     
     request.status = "rejected"
-    request.responded_at = datetime.utcnow()
+    request.responded_at = utc_now()
     db.commit()
     
     return {"message": "Request rejected"}
@@ -3644,7 +3808,300 @@ async def get_conversation_messages(
             for m in messages
         ]
     }
-# ================== APPOINTMENT BOOKING SYSTEM ==================
+# ================== APPOINTMENT BOOKING + REMINDERS ==================
+
+APPOINTMENT_REMINDER_OFFSETS = {
+    "24_hour": timedelta(hours=24),
+    "1_hour": timedelta(hours=1),
+}
+
+
+def _appointment_start(appointment: AppointmentModel) -> datetime:
+    try:
+        return datetime.strptime(
+            f"{appointment.appointment_date} {appointment.appointment_time[:5]}",
+            "%Y-%m-%d %H:%M",
+        ).replace(tzinfo=APPOINTMENT_TIMEZONE)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Appointment date or time is invalid") from exc
+
+
+def _utc_database_time(value: datetime) -> datetime:
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _utc_api_time(value: Optional[datetime]) -> Optional[str]:
+    if value is None:
+        return None
+    return value.replace(tzinfo=timezone.utc).isoformat()
+
+
+def _sync_appointment_reminders_for_appointment(
+    db: Session,
+    appointment: AppointmentModel,
+) -> None:
+    reminders = {
+        item.reminder_type: item
+        for item in db.query(AppointmentReminderModel).filter(
+            AppointmentReminderModel.appointment_id == appointment.id
+        ).all()
+    }
+    try:
+        starts_at = _appointment_start(appointment)
+    except ValueError:
+        starts_at = None
+
+    should_schedule = (
+        appointment.status == "approved"
+        and starts_at is not None
+        and starts_at > datetime.now(APPOINTMENT_TIMEZONE)
+    )
+    if not should_schedule:
+        for reminder in reminders.values():
+            if reminder.status in {"scheduled", "processing"}:
+                reminder.status = "cancelled"
+                reminder.updated_at = utc_now()
+        return
+
+    starts_at_utc = _utc_database_time(starts_at)
+    for reminder_type, offset in APPOINTMENT_REMINDER_OFFSETS.items():
+        scheduled_for = starts_at_utc - offset
+        reminder = reminders.get(reminder_type)
+        if reminder is None:
+            db.add(
+                AppointmentReminderModel(
+                    appointment_id=appointment.id,
+                    patient_email=appointment.patient_email,
+                    reminder_type=reminder_type,
+                    scheduled_for=scheduled_for,
+                    status="scheduled",
+                )
+            )
+            continue
+        reminder.patient_email = appointment.patient_email
+        if reminder.status in {"scheduled", "cancelled"}:
+            reminder.scheduled_for = scheduled_for
+            reminder.status = "scheduled"
+            reminder.sent_at = None
+            reminder.updated_at = utc_now()
+
+
+def _appointment_reminder_message(
+    appointment: AppointmentModel,
+    clinician,
+    reminder_type: str,
+) -> tuple[str, str]:
+    clinician_name = clinician.name if clinician else "your clinician"
+    visit_type = (appointment.appointment_type or "appointment").replace(
+        "_", " "
+    ).title()
+    timing = "in about 24 hours" if reminder_type == "24_hour" else "in about 1 hour"
+    title = (
+        "Appointment reminder — tomorrow"
+        if reminder_type == "24_hour"
+        else "Appointment reminder — 1 hour"
+    )
+    message = (
+        f"Your {visit_type.lower()} with {clinician_name} is {timing}, "
+        f"on {appointment.appointment_date} at {appointment.appointment_time[:5]} "
+        f"({APPOINTMENT_TIMEZONE_NAME})."
+    )
+    return title, message
+
+
+def _deliver_due_appointment_reminders(
+    db: Session,
+    *,
+    patient_email: Optional[str] = None,
+) -> int:
+    """Synchronize reminders and atomically deliver due patient notices."""
+    now = utc_now()
+    stale_before = now - timedelta(minutes=5)
+    stale_query = db.query(AppointmentReminderModel).filter(
+        AppointmentReminderModel.status == "processing",
+        AppointmentReminderModel.updated_at < stale_before,
+    )
+    if patient_email:
+        stale_query = stale_query.filter(
+            AppointmentReminderModel.patient_email == patient_email
+        )
+    stale_query.update(
+        {
+            AppointmentReminderModel.status: "scheduled",
+            AppointmentReminderModel.updated_at: now,
+        },
+        synchronize_session=False,
+    )
+
+    appointment_query = db.query(AppointmentModel).filter(
+        AppointmentModel.status == "approved"
+    )
+    if patient_email:
+        appointment_query = appointment_query.filter(
+            AppointmentModel.patient_email == patient_email
+        )
+    for appointment in appointment_query.all():
+        _sync_appointment_reminders_for_appointment(db, appointment)
+    db.flush()
+
+    reminder_query = db.query(AppointmentReminderModel).filter(
+        AppointmentReminderModel.status == "scheduled",
+        AppointmentReminderModel.scheduled_for <= now,
+    )
+    if patient_email:
+        reminder_query = reminder_query.filter(
+            AppointmentReminderModel.patient_email == patient_email
+        )
+
+    delivered = 0
+    due_reminders = reminder_query.order_by(
+        AppointmentReminderModel.scheduled_for.asc()
+    ).all()
+    due_one_hour_appointments = {
+        reminder.appointment_id
+        for reminder in due_reminders
+        if reminder.reminder_type == "1_hour"
+    }
+    for reminder in due_reminders:
+        if (
+            reminder.reminder_type == "24_hour"
+            and reminder.appointment_id in due_one_hour_appointments
+        ):
+            reminder.status = "skipped"
+            reminder.updated_at = now
+            continue
+        appointment = db.query(AppointmentModel).filter(
+            AppointmentModel.id == reminder.appointment_id
+        ).first()
+        try:
+            starts_at = _appointment_start(appointment) if appointment else None
+        except ValueError:
+            starts_at = None
+        if (
+            appointment is None
+            or appointment.status != "approved"
+            or starts_at is None
+            or starts_at <= datetime.now(APPOINTMENT_TIMEZONE)
+        ):
+            reminder.status = "cancelled"
+            reminder.updated_at = now
+            continue
+
+        claimed = db.query(AppointmentReminderModel).filter(
+            AppointmentReminderModel.id == reminder.id,
+            AppointmentReminderModel.status == "scheduled",
+        ).update(
+            {
+                AppointmentReminderModel.status: "processing",
+                AppointmentReminderModel.updated_at: now,
+            },
+            synchronize_session=False,
+        )
+        if claimed != 1:
+            continue
+        db.flush()
+        clinician = db.query(ClinicianModel).filter(
+            ClinicianModel.email == appointment.clinician_email
+        ).first()
+        title, message = _appointment_reminder_message(
+            appointment,
+            clinician,
+            reminder.reminder_type,
+        )
+        db.add(
+            NotificationModel(
+                user_email=appointment.patient_email,
+                title=title,
+                message=message,
+                type="appointment_reminder",
+                is_read=False,
+            )
+        )
+        reminder.status = "sent"
+        reminder.sent_at = now
+        reminder.updated_at = now
+        delivered += 1
+    db.commit()
+    return delivered
+
+
+def _appointment_reminder_payload(
+    reminder: AppointmentReminderModel,
+    appointment: AppointmentModel,
+    clinician,
+) -> dict:
+    try:
+        starts_at = _appointment_start(appointment)
+    except ValueError:
+        starts_at = None
+    return {
+        "id": reminder.id,
+        "appointment_id": appointment.id,
+        "reminder_type": reminder.reminder_type,
+        "status": reminder.status,
+        "scheduled_for": _utc_api_time(reminder.scheduled_for),
+        "sent_at": _utc_api_time(reminder.sent_at),
+        "appointment_date": appointment.appointment_date,
+        "appointment_time": appointment.appointment_time[:5],
+        "appointment_type": appointment.appointment_type,
+        "appointment_status": appointment.status,
+        "appointment_starts_at": starts_at.isoformat() if starts_at else None,
+        "appointment_timezone": APPOINTMENT_TIMEZONE_NAME,
+        "clinician_name": clinician.name if clinician else "Unknown Clinician",
+        "clinician_specialization": (
+            clinician.specialization if clinician else None
+        ),
+    }
+
+
+@app.get("/api/appointment-reminders")
+async def get_appointment_reminders(
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if current_user.role != "patient":
+        raise HTTPException(
+            status_code=403,
+            detail="Appointment reminders are available only to patients",
+        )
+    _deliver_due_appointment_reminders(
+        db,
+        patient_email=current_user.email,
+    )
+    reminders = db.query(AppointmentReminderModel).filter(
+        AppointmentReminderModel.patient_email == current_user.email,
+        AppointmentReminderModel.status.in_(["scheduled", "sent"]),
+    ).order_by(
+        AppointmentReminderModel.scheduled_for.asc()
+    ).all()
+    result = []
+    now = utc_now()
+    for reminder in reminders:
+        appointment = db.query(AppointmentModel).filter(
+            AppointmentModel.id == reminder.appointment_id
+        ).first()
+        if not appointment or appointment.status != "approved":
+            continue
+        try:
+            if _utc_database_time(_appointment_start(appointment)) <= now:
+                continue
+        except (TypeError, ValueError):
+            continue
+        clinician = db.query(ClinicianModel).filter(
+            ClinicianModel.email == appointment.clinician_email
+        ).first()
+        result.append(
+            _appointment_reminder_payload(
+                reminder,
+                appointment,
+                clinician,
+            )
+        )
+    return {
+        "reminders": result,
+        "appointment_timezone": APPOINTMENT_TIMEZONE_NAME,
+        "delivery": "in_app_notification",
+    }
 
 @app.post("/api/appointments")
 async def create_appointment(
@@ -3710,6 +4167,15 @@ async def create_appointment(
         raise HTTPException(
             status_code=400,
             detail="The selected time is outside this clinician's consultation hours"
+        )
+    if _time_range_overlaps_break(
+        requested_start,
+        requested_end,
+        _consultation_breaks(clinician).get(day_name, []),
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="The selected time overlaps a clinician break",
         )
 
     existing_appointments = db.query(AppointmentModel).filter(
@@ -4027,7 +4493,8 @@ async def update_appointment_status(
     if status_data.notes is not None:
         appointment.notes = status_data.notes
 
-    appointment.updated_at = datetime.utcnow()
+    appointment.updated_at = utc_now()
+    _sync_appointment_reminders_for_appointment(db, appointment)
 
     db.commit()
     db.refresh(appointment)
@@ -4082,7 +4549,7 @@ async def update_appointment_notes(
         )
 
     appointment.notes = notes_data.notes.strip()
-    appointment.updated_at = datetime.utcnow()
+    appointment.updated_at = utc_now()
     db.commit()
     db.refresh(appointment)
     return {
@@ -4265,8 +4732,8 @@ async def create_prescription(
                 "diagnosis": prescription_data.diagnosis,
                 "instructions": prescription_data.instructions,
                 "medicines_json": json.dumps(medicines),
-                "created_at": datetime.utcnow(),
-                "updated_at": datetime.utcnow(),
+                "created_at": utc_now(),
+                "updated_at": utc_now(),
             }
         )
         prescription_id = getattr(result, "lastrowid", None)
@@ -4422,7 +4889,7 @@ async def update_prescription_status(
         """),
         {
             "status": status_data.status,
-            "updated_at": datetime.utcnow(),
+            "updated_at": utc_now(),
             "id": prescription_id,
         }
     )
@@ -4565,35 +5032,57 @@ def _queue_notification(
 
 
 def _apply_due_emergency_escalations(db: Session) -> None:
-    """Apply the escalation policy whenever a staff monitoring view polls."""
-    now = datetime.utcnow()
+    """Claim due deadlines atomically, then apply the escalation policy."""
+    now = utc_now()
     due_alerts = db.query(EmergencyAlertModel).filter(
         EmergencyAlertModel.status.in_(["active", "acknowledged"]),
         EmergencyAlertModel.next_review_at.isnot(None),
         EmergencyAlertModel.next_review_at <= now,
-    ).with_for_update(skip_locked=True).all()
+    ).all()
     if not due_alerts:
         return
 
     admin_emails = [row[0] for row in db.query(AdminModel.email).all()]
     for alert in due_alerts:
+        expected_review_at = alert.next_review_at
         previous_level = alert.escalation_level or 1
-        alert.escalation_level = min(
+        next_level = min(
             previous_level + 1,
             EMERGENCY_MAX_ESCALATION_LEVEL,
         )
-        alert.operational_state = "escalated"
-        alert.last_monitored_at = now
-        alert.next_review_at = now + timedelta(
+        next_review_at = now + timedelta(
             minutes=(
                 EMERGENCY_REVIEW_MINUTES
-                if alert.escalation_level < EMERGENCY_MAX_ESCALATION_LEVEL
+                if next_level < EMERGENCY_MAX_ESCALATION_LEVEL
                 else EMERGENCY_REVIEW_MINUTES * 3
             )
         )
+
+        # This compare-and-update is portable across MySQL and older MariaDB.
+        # If another process already advanced the same deadline, rowcount is
+        # zero and this worker does not duplicate events or notifications.
+        claimed = db.query(EmergencyAlertModel).filter(
+            EmergencyAlertModel.id == alert.id,
+            EmergencyAlertModel.status.in_(["active", "acknowledged"]),
+            EmergencyAlertModel.next_review_at == expected_review_at,
+            EmergencyAlertModel.next_review_at <= now,
+        ).update(
+            {
+                EmergencyAlertModel.escalation_level: next_level,
+                EmergencyAlertModel.operational_state: "escalated",
+                EmergencyAlertModel.last_monitored_at: now,
+                EmergencyAlertModel.next_review_at: next_review_at,
+            },
+            synchronize_session=False,
+        )
+        if claimed != 1:
+            continue
+
+        db.flush()
+        db.refresh(alert)
         event_type = (
             "auto_escalated"
-            if alert.escalation_level > previous_level
+            if next_level > previous_level
             else "review_overdue"
         )
         _record_emergency_event(
@@ -4757,7 +5246,7 @@ async def create_emergency_alert(
             detail="Review and accept the SOS safety disclosure before using SOS",
         )
 
-    now = datetime.utcnow()
+    now = utc_now()
     existing_alert = db.query(EmergencyAlertModel).filter(
         EmergencyAlertModel.patient_email == current_user.email,
         EmergencyAlertModel.status.in_(["active", "acknowledged"]),
@@ -4846,6 +5335,137 @@ async def create_emergency_alert(
     }
 
 
+@app.get("/api/emergency-alerts/my-open")
+async def get_my_open_emergency_alert(
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if current_user.role != "patient":
+        raise HTTPException(
+            status_code=403,
+            detail="Patient access is required",
+        )
+    alert = db.query(EmergencyAlertModel).filter(
+        EmergencyAlertModel.patient_email == current_user.email,
+        EmergencyAlertModel.status.in_(["active", "acknowledged"]),
+    ).order_by(EmergencyAlertModel.created_at.desc()).first()
+    if not alert:
+        return {"active": False, "alert": None}
+    return {
+        "active": True,
+        "alert": {
+            "id": alert.id,
+            "status": alert.status,
+            "created_at": (
+                alert.created_at.isoformat() if alert.created_at else None
+            ),
+            "acknowledged_at": (
+                alert.acknowledged_at.isoformat()
+                if alert.acknowledged_at
+                else None
+            ),
+            "owner_assigned": bool(alert.owner_email),
+            "escalation_level": alert.escalation_level or 1,
+        },
+        "notice": (
+            "CareConnect is monitoring this SOS. If it was activated by "
+            "mistake and no assistance is needed, you can report a false alarm."
+        ),
+    }
+
+
+@app.put("/api/emergency-alerts/{alert_id}/false-alarm")
+async def report_emergency_false_alarm(
+    alert_id: int,
+    false_alarm_data: EmergencyFalseAlarmRequest,
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if current_user.role != "patient":
+        raise HTTPException(
+            status_code=403,
+            detail="Only the patient who created the SOS can report a false alarm",
+        )
+    if not false_alarm_data.confirmed:
+        raise HTTPException(
+            status_code=400,
+            detail="False-alarm confirmation is required",
+        )
+    alert = db.query(EmergencyAlertModel).filter(
+        EmergencyAlertModel.id == alert_id,
+        EmergencyAlertModel.patient_email == current_user.email,
+    ).first()
+    if not alert:
+        raise HTTPException(status_code=404, detail="Emergency alert not found")
+    if alert.status == "resolved":
+        return {
+            "message": "This SOS is already closed",
+            "alert_id": alert.id,
+            "status": alert.status,
+        }
+
+    now = utc_now()
+    alert.status = "resolved"
+    alert.resolved_by = current_user.email
+    alert.resolved_at = now
+    alert.operational_state = "false_alarm"
+    alert.last_monitored_at = now
+    alert.next_review_at = None
+    _record_emergency_event(
+        db,
+        alert,
+        "false_alarm",
+        actor_email=current_user.email,
+        actor_role=current_user.role,
+        notes=(
+            "Patient confirmed the SOS was activated accidentally and closed "
+            "CareConnect monitoring."
+        ),
+    )
+
+    recipients = {
+        row[0] for row in db.query(AdminModel.email).all()
+    }
+    recipients.update(
+        get_connected_clinician_emails_for_patient(db, alert.patient_email)
+    )
+    if alert.owner_email:
+        recipients.add(alert.owner_email)
+    recipients.discard(current_user.email)
+    for recipient in recipients:
+        _queue_notification(
+            db,
+            user_email=recipient,
+            title="SOS closed as false alarm",
+            message=(
+                f"{alert.patient_name or alert.patient_email} reported that "
+                "the SOS was activated accidentally. The CareConnect "
+                "monitoring workflow is now closed."
+            ),
+        )
+    _queue_notification(
+        db,
+        user_email=current_user.email,
+        title="SOS closed as false alarm",
+        message=(
+            "CareConnect monitoring was closed and your care team was "
+            "notified. This does not cancel any emergency services contacted "
+            "outside CareConnect."
+        ),
+    )
+    db.commit()
+    return {
+        "message": "SOS closed as a false alarm",
+        "alert_id": alert.id,
+        "status": alert.status,
+        "operational_state": alert.operational_state,
+        "notice": (
+            "Your care team was notified. If symptoms are present or you need "
+            "help, use SOS again or contact local emergency services."
+        ),
+    }
+
+
 @app.get("/api/emergency-alerts")
 async def get_emergency_alerts(
     status: Optional[str] = None,
@@ -4922,7 +5542,7 @@ async def get_emergency_alert_monitoring(
             }
         query = query.filter(EmergencyAlertModel.patient_email.in_(patient_emails))
 
-    now = datetime.utcnow()
+    now = utc_now()
     scoped_alerts = query.all()
     return {
         "active": len(scoped_alerts),
@@ -4963,7 +5583,7 @@ async def claim_emergency_alert(
             detail=f"This alert is already owned by {alert.owner_email}",
         )
 
-    now = datetime.utcnow()
+    now = utc_now()
     newly_claimed = not alert.owner_email
     _assign_emergency_owner(alert, current_user, now=now)
     _record_emergency_event(
@@ -5008,7 +5628,7 @@ async def acknowledge_emergency_alert(
     if alert.status == "resolved":
         raise HTTPException(status_code=409, detail="This alert is already resolved")
 
-    now = datetime.utcnow()
+    now = utc_now()
     if not alert.owner_email:
         _assign_emergency_owner(alert, current_user, now=now)
     else:
@@ -5066,7 +5686,7 @@ async def check_in_emergency_alert(
     if alert.status == "resolved":
         raise HTTPException(status_code=409, detail="This alert is already resolved")
 
-    now = datetime.utcnow()
+    now = utc_now()
     alert.last_monitored_at = now
     alert.next_review_at = now + timedelta(minutes=EMERGENCY_REVIEW_MINUTES)
     _record_emergency_event(
@@ -5102,7 +5722,7 @@ async def escalate_emergency_alert(
     if (alert.escalation_level or 1) >= EMERGENCY_MAX_ESCALATION_LEVEL:
         raise HTTPException(status_code=409, detail="Alert is already at level 3")
 
-    now = datetime.utcnow()
+    now = utc_now()
     alert.escalation_level = (alert.escalation_level or 1) + 1
     alert.operational_state = "escalated"
     alert.last_monitored_at = now
@@ -5157,7 +5777,7 @@ async def resolve_emergency_alert(
             "status": alert.status,
         }
 
-    now = datetime.utcnow()
+    now = utc_now()
     if not alert.owner_email:
         _assign_emergency_owner(alert, current_user, now=now)
     else:
@@ -5491,7 +6111,7 @@ async def upload_record_version(
     )
 
     record.file_path = str(file_path)
-    record.uploaded_at = datetime.utcnow()
+    record.uploaded_at = utc_now()
 
     if analysis_summary:
         record.analysis_summary = analysis_summary
@@ -5659,7 +6279,7 @@ async def forgot_password(
 
     # Generate secure token
     token = secrets.token_urlsafe(32)
-    expiry = datetime.utcnow() + timedelta(minutes=15)
+    expiry = utc_now() + timedelta(minutes=15)
 
     user.reset_password_token = hashlib.sha256(token.encode("utf-8")).hexdigest()
     user.reset_password_expires = expiry
@@ -5693,15 +6313,15 @@ async def reset_password(
     user = (
         db.query(PatientModel).filter(
             PatientModel.reset_password_token == token_digest,
-            PatientModel.reset_password_expires > datetime.utcnow()
+            PatientModel.reset_password_expires > utc_now()
         ).first()
         or db.query(ClinicianModel).filter(
             ClinicianModel.reset_password_token == token_digest,
-            ClinicianModel.reset_password_expires > datetime.utcnow()
+            ClinicianModel.reset_password_expires > utc_now()
         ).first()
         or db.query(AdminModel).filter(
             AdminModel.reset_password_token == token_digest,
-            AdminModel.reset_password_expires > datetime.utcnow()
+            AdminModel.reset_password_expires > utc_now()
         ).first()
     )
 
@@ -5722,7 +6342,7 @@ async def reset_password(
         UserSessionModel.revoked_at.is_(None),
     ).update(
         {
-            UserSessionModel.revoked_at: datetime.utcnow(),
+            UserSessionModel.revoked_at: utc_now(),
             UserSessionModel.revoke_reason: "password_reset",
         },
         synchronize_session=False,
@@ -5742,7 +6362,7 @@ async def register(user_data: UserRegister, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Email already registered")
     hashed_password = get_password_hash(user_data.password)
     # verification_code = generate_verification_code()
-    # verification_expires = datetime.utcnow() + timedelta(minutes=10)
+    # verification_expires = utc_now() + timedelta(minutes=10)
     if user_data.role == "patient":
         new_user = PatientModel(name=user_data.name, email=user_data.email,
                                 hashed_password=hashed_password, role="patient",
@@ -5807,7 +6427,7 @@ async def register(user_data: UserRegister, db: Session = Depends(get_db)):
 #     if not user.email_verification_code or not user.email_verification_expires:
 #         raise HTTPException(status_code=400, detail="Verification code not found. Please register again.")
 
-#     if user.email_verification_expires < datetime.utcnow():
+#     if user.email_verification_expires < utc_now():
 #         raise HTTPException(status_code=400, detail="Verification code expired. Please register again.")
 
 #     if user.email_verification_code != data.code:
@@ -5990,7 +6610,7 @@ async def logout_current_session(
         UserSessionModel.user_role == current_user.role,
     ).first()
     if session and session.revoked_at is None:
-        session.revoked_at = datetime.utcnow()
+        session.revoked_at = utc_now()
         session.revoke_reason = "user_logout"
         db.commit()
     return {"message": "Session ended"}
@@ -6002,7 +6622,7 @@ async def list_user_sessions(
     current_user=Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    now = datetime.utcnow()
+    now = utc_now()
     sessions = db.query(UserSessionModel).filter(
         UserSessionModel.user_email == current_user.email,
         UserSessionModel.user_role == current_user.role,
@@ -6040,7 +6660,7 @@ async def revoke_user_session(
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     if session.revoked_at is None:
-        session.revoked_at = datetime.utcnow()
+        session.revoked_at = utc_now()
         session.revoke_reason = "user_revoked"
         db.commit()
     return {"message": "Session revoked"}
@@ -6819,7 +7439,7 @@ async def export_patient_clinical_summary(
     ).order_by(PatientProfileHistoryModel.recorded_at.desc()).all()
 
     payload = {
-        "exported_at": datetime.utcnow().isoformat(),
+        "exported_at": utc_now_aware().isoformat(),
         "exported_by": current_user.email,
         "patient": _patient_profile_payload(patient),
         "records": [
@@ -6948,7 +7568,7 @@ async def get_stats(db: Session = Depends(get_db), current_user = Depends(get_cu
     total_users = total_patients + total_clinicians + total_admins
     active_sessions = db.query(UserSessionModel).filter(
         UserSessionModel.revoked_at.is_(None),
-        UserSessionModel.expires_at > datetime.utcnow(),
+        UserSessionModel.expires_at > utc_now(),
     ).count()
     
     return {
@@ -7916,7 +8536,7 @@ async def patient_chatbot(
             "patient_blood_type": patient.blood_type,
             "health_status": patient_context.get("patient_info", {}).get("health_status"),
             "response_source": response_source,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": utc_now_aware().isoformat(),
         }
 
     except HTTPException:

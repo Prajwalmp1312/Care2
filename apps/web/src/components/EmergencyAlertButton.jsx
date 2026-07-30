@@ -8,6 +8,8 @@ const EmergencyAlertButton = ({ onAlertCreated }) => {
   const [consentAccepted, setConsentAccepted] = useState(null);
   const [consent, setConsent] = useState(null);
   const [consentError, setConsentError] = useState("");
+  const [activeAlert, setActiveAlert] = useState(null);
+  const [showFalseAlarmConfirm, setShowFalseAlarmConfirm] = useState(false);
 
   const requestHeaders = () => ({
     Authorization: `Bearer ${localStorage.getItem("access_token")}`,
@@ -30,6 +32,27 @@ const EmergencyAlertButton = ({ onAlertCreated }) => {
     };
   }, []);
 
+  const loadOpenAlert = async () => {
+    try {
+      const response = await axios.get("/api/emergency-alerts/my-open", {
+        headers: requestHeaders(),
+      });
+      setActiveAlert(response.data.active ? response.data.alert : null);
+      if (!response.data.active) setShowFalseAlarmConfirm(false);
+    } catch (err) {
+      console.error(
+        "Unable to check SOS status:",
+        err.response?.data || err,
+      );
+    }
+  };
+
+  useEffect(() => {
+    loadOpenAlert();
+    const poller = window.setInterval(loadOpenAlert, 15000);
+    return () => window.clearInterval(poller);
+  }, []);
+
   const postSos = async () => {
     const response = await axios.post(
       "/api/emergency-alerts",
@@ -48,8 +71,47 @@ const EmergencyAlertButton = ({ onAlertCreated }) => {
         response.data.notice ||
         "SOS sent. Your care team and administrators were notified.",
     });
+    setActiveAlert({
+      id: response.data.alert_id,
+      status: response.data.status,
+      escalation_level: response.data.escalation_level || 1,
+    });
     window.dispatchEvent(new Event("careconnect:notifications-updated"));
     onAlertCreated?.();
+  };
+
+  const reportFalseAlarm = async () => {
+    if (!activeAlert || submitting) return;
+    try {
+      setSubmitting(true);
+      const response = await axios.put(
+        `/api/emergency-alerts/${activeAlert.id}/false-alarm`,
+        { confirmed: true },
+        { headers: requestHeaders() },
+      );
+      setActiveAlert(null);
+      setShowFalseAlarmConfirm(false);
+      setFeedback({
+        type: "success",
+        message:
+          response.data.notice ||
+          "The SOS was closed as a false alarm and your care team was notified.",
+      });
+      window.dispatchEvent(new Event("careconnect:notifications-updated"));
+    } catch (err) {
+      console.error(
+        "False alarm update failed:",
+        err.response?.data || err,
+      );
+      setFeedback({
+        type: "error",
+        message:
+          err.response?.data?.detail ||
+          "Unable to close the SOS as a false alarm.",
+      });
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   const triggerSos = async () => {
@@ -112,7 +174,7 @@ const EmergencyAlertButton = ({ onAlertCreated }) => {
   };
 
   return (
-    <div className="relative">
+    <div className="relative flex items-center gap-2">
       <button
         type="button"
         onClick={triggerSos}
@@ -129,10 +191,64 @@ const EmergencyAlertButton = ({ onAlertCreated }) => {
         {submitting ? "SENDING" : "SOS"}
       </button>
 
+      {activeAlert && (
+        <button
+          type="button"
+          onClick={() => {
+            setFeedback(null);
+            setShowFalseAlarmConfirm(true);
+          }}
+          disabled={submitting}
+          className="rounded-full border border-amber-300 bg-amber-50 px-3 py-2 text-xs font-bold text-amber-800 transition hover:bg-amber-100 disabled:opacity-60"
+          title="Close an accidentally activated SOS"
+        >
+          <i className="fas fa-rotate-left mr-1"></i>
+          False alarm
+        </button>
+      )}
+
       <span id="sos-help-text" className="sr-only">
         Sends a critical CareConnect alert without asking for emergency
         details. This does not automatically dispatch emergency services.
       </span>
+
+      {showFalseAlarmConfirm && activeAlert && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="false-alarm-title"
+          className="absolute right-0 top-full z-[80] mt-3 w-80 rounded-xl border border-amber-200 bg-white p-4 text-sm shadow-2xl"
+        >
+          <h3
+            id="false-alarm-title"
+            className="font-bold text-slate-900"
+          >
+            Was the SOS activated accidentally?
+          </h3>
+          <p className="mt-2 leading-5 text-slate-600">
+            Confirm only if no emergency assistance is needed. This closes
+            CareConnect monitoring and notifies the care team, but it cannot
+            cancel emergency services contacted outside CareConnect.
+          </p>
+          <div className="mt-4 flex justify-end gap-2">
+            <button
+              type="button"
+              onClick={() => setShowFalseAlarmConfirm(false)}
+              className="rounded-lg border border-slate-300 px-3 py-2 font-semibold text-slate-700"
+            >
+              Keep SOS active
+            </button>
+            <button
+              type="button"
+              onClick={reportFalseAlarm}
+              disabled={submitting}
+              className="rounded-lg bg-amber-600 px-3 py-2 font-semibold text-white hover:bg-amber-700 disabled:opacity-60"
+            >
+              Confirm false alarm
+            </button>
+          </div>
+        </div>
+      )}
 
       {feedback && (
         <div

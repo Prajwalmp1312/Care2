@@ -28,6 +28,8 @@ import RoleDashboardWidgets from "./RoleDashboardWidgets";
 import AdminAnalytics from "./AdminAnalytics";
 import ClinicalExportButton from "./ClinicalExportButton";
 import ChatProductivityToolbar from "./ChatProductivityToolbar";
+import CareConnections from "./CareConnections";
+import ClinicianAvailabilityEditor from "./ClinicianAvailabilityEditor";
 
 const MealPlanner = lazy(() => import("../meal-planner/MealPlanner"));
 
@@ -126,14 +128,12 @@ const Dashboard = () => {
   const [healthTipsLoading, setHealthTipsLoading] = useState(false);
 
   // Messaging state
-  const [clinicians, setClinicians] = useState([]);
   const [messageRequests, setMessageRequests] = useState([]);
   const [conversations, setConversations] = useState([]);
   const [selectedConversation, setSelectedConversation] = useState(null);
   const [conversationMessages, setConversationMessages] = useState([]);
   const [newMessage, setNewMessage] = useState("");
   const [messageSearch, setMessageSearch] = useState("");
-  const [messagingView, setMessagingView] = useState("browse");
   const conversationScrollRef = useRef(null);
   const [editingMessageId, setEditingMessageId] = useState(null);
   const [editingMessageText, setEditingMessageText] = useState("");
@@ -297,13 +297,6 @@ const Dashboard = () => {
       setCurrentView(savedCurrentView);
     }
 
-    const savedMessagingView = localStorage.getItem(
-      getDashboardStorageKey(user.role, "messagingView"),
-    );
-    if (savedMessagingView) {
-      setMessagingView(savedMessagingView);
-    }
-
     if (user.role === "admin") {
       const savedAdminView = localStorage.getItem(
         getDashboardStorageKey(user.role, "adminView"),
@@ -351,14 +344,6 @@ const Dashboard = () => {
       currentView,
     );
   }, [currentView, user?.role]);
-
-  useEffect(() => {
-    if (!user?.role) return;
-    localStorage.setItem(
-      getDashboardStorageKey(user.role, "messagingView"),
-      messagingView,
-    );
-  }, [messagingView, user?.role]);
 
   useEffect(() => {
     if (user?.role !== "admin") return;
@@ -453,18 +438,6 @@ const Dashboard = () => {
     } catch (err) {
       console.error("Delete failed:", err);
       alert("Failed to delete record");
-    }
-  };
-
-  const loadClinicians = async () => {
-    try {
-      const token = localStorage.getItem("access_token");
-      const res = await axios.get("/api/clinicians", {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      setClinicians(res.data.clinicians);
-    } catch (err) {
-      console.error("Error loading clinicians:", err);
     }
   };
 
@@ -704,7 +677,6 @@ const Dashboard = () => {
     }
 
     setCurrentView("messages");
-    setMessagingView("conversations");
     setSelectedConversation(conversation || null);
     if (conversation) {
       loadConversationMessages(conversation.other_user_email);
@@ -715,21 +687,6 @@ const Dashboard = () => {
             : item,
         ),
       );
-    }
-  };
-
-  const handleRequestMessage = async (clinicianEmail) => {
-    try {
-      const token = localStorage.getItem("access_token");
-      await axios.post(
-        "/api/message-requests",
-        { clinician_email: clinicianEmail },
-        { headers: { Authorization: `Bearer ${token}` } },
-      );
-      alert("Request sent successfully!");
-      loadMessageRequests();
-    } catch (err) {
-      alert(err.response?.data?.detail || "Error sending request");
     }
   };
 
@@ -976,11 +933,8 @@ const Dashboard = () => {
   useEffect(() => {
     if (currentView === "messages") {
       if (user?.role === "patient") {
-        loadClinicians();
-        loadMessageRequests();
         loadConversations();
       } else if (user?.role === "clinician") {
-        loadMessageRequests();
         loadConversations();
       }
     }
@@ -1225,7 +1179,6 @@ const Dashboard = () => {
 
     // Load messaging data on initial mount
     if (user.role === "patient") {
-      loadClinicians();
       loadMessageRequests();
       loadConversations();
     } else if (user.role === "clinician") {
@@ -1535,7 +1488,9 @@ const Dashboard = () => {
                     >
                       <i className="fas fa-user-circle text-blue-600"></i>
                       <span className="text-gray-700 font-medium">
-                        User Details
+                        {user?.role === "clinician"
+                          ? "Profile & Schedule"
+                          : "User Details"}
                       </span>
                     </button>
                     <button
@@ -1579,7 +1534,9 @@ const Dashboard = () => {
               animate={{ scale: 1, opacity: 1 }}
               exit={{ scale: 0.9, opacity: 0 }}
               onClick={(e) => e.stopPropagation()}
-              className="bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto"
+              className={`bg-white rounded-2xl shadow-2xl w-full max-h-[90vh] overflow-y-auto ${
+                user?.role === "clinician" ? "max-w-5xl" : "max-w-2xl"
+              }`}
             >
               {/* Modal Header */}
               <div className="sticky top-0 bg-gradient-to-r from-blue-600 to-indigo-600 text-white p-6 rounded-t-2xl">
@@ -1591,7 +1548,11 @@ const Dashboard = () => {
                       ></i>
                     </div>
                     <div>
-                      <h2 className="text-2xl font-bold">User Profile</h2>
+                      <h2 className="text-2xl font-bold">
+                        {user?.role === "clinician"
+                          ? "Clinician Profile"
+                          : "User Profile"}
+                      </h2>
                       <p className="text-sm opacity-90 capitalize">
                         {user?.role} Account
                       </p>
@@ -1945,6 +1906,12 @@ const Dashboard = () => {
                   </div>
                 )}
 
+                {user?.role === "clinician" && (
+                  <div className="pt-4">
+                    <ClinicianAvailabilityEditor />
+                  </div>
+                )}
+
                 {/* Account Info */}
                 <div className="space-y-4 pt-4">
                   <h3 className="text-lg font-semibold text-gray-800 border-b pb-2">
@@ -1995,7 +1962,9 @@ const Dashboard = () => {
                   }`}
                 >
                   <i className="fas fa-save"></i>
-                  Save Changes
+                  {user?.role === "clinician"
+                    ? "Save Profile Details"
+                    : "Save Changes"}
                 </button>
 
                 {/* Delete Account */}
@@ -2290,6 +2259,13 @@ const Dashboard = () => {
         {user?.role !== "admin" &&
           tabButton("messages", "Messages", "fa-comments")}
 
+        {user?.role !== "admin" &&
+          tabButton(
+            "care-team",
+            user?.role === "patient" ? "Find Care" : "Patient Requests",
+            user?.role === "patient" ? "fa-user-doctor" : "fa-user-plus",
+          )}
+
         {["clinician", "admin"].includes(user?.role) &&
           tabButton("clinical-search", "Clinical Search", "fa-search")}
 
@@ -2434,8 +2410,7 @@ const Dashboard = () => {
                     </h3>
                     <button
                       onClick={() => {
-                        setCurrentView("messages");
-                        setMessagingView("requests");
+                        setCurrentView("care-team");
                       }}
                       className="text-blue-600 hover:text-blue-700 text-sm font-medium"
                     >
@@ -2513,7 +2488,6 @@ const Dashboard = () => {
                         key={conv.conversation_id}
                         onClick={() => {
                           setCurrentView("messages");
-                          setMessagingView("conversations");
                           setSelectedConversation(conv);
                           loadConversationMessages(conv.other_user_email);
                         }}
@@ -2559,8 +2533,7 @@ const Dashboard = () => {
                   <div className="space-y-2">
                     <button
                       onClick={() => {
-                        setCurrentView("messages");
-                        setMessagingView("requests");
+                        setCurrentView("care-team");
                       }}
                       className="w-full flex items-center gap-3 p-3 bg-yellow-50 hover:bg-yellow-100 rounded-lg transition text-left"
                     >
@@ -2580,7 +2553,6 @@ const Dashboard = () => {
                     <button
                       onClick={() => {
                         setCurrentView("messages");
-                        setMessagingView("conversations");
                       }}
                       className="w-full flex items-center gap-3 p-3 bg-blue-50 hover:bg-blue-100 rounded-lg transition text-left"
                     >
@@ -5237,174 +5209,18 @@ const Dashboard = () => {
             initial={{ y: 20, opacity: 0 }}
             animate={{ y: 0, opacity: 1 }}
           >
-            <h2 className="text-2xl font-bold text-gray-800 mb-4">Messages</h2>
-
-            {/* Sub Navigation */}
-            <div className="flex gap-2 mb-6 border-b">
-              <button
-                onClick={() => {
-                  setMessagingView("browse");
-                  setSelectedConversation(null);
-                }}
-                className={`px-4 py-2 font-medium transition ${
-                  messagingView === "browse"
-                    ? "border-b-2 border-blue-600 text-blue-600"
-                    : "text-gray-600 hover:text-blue-600"
-                }`}
-              >
-                Browse Clinicians
-              </button>
-              <button
-                onClick={() => {
-                  setMessagingView("requests");
-                  setSelectedConversation(null);
-                }}
-                className={`px-4 py-2 font-medium transition ${
-                  messagingView === "requests"
-                    ? "border-b-2 border-blue-600 text-blue-600"
-                    : "text-gray-600 hover:text-blue-600"
-                }`}
-              >
-                My Requests ({messageRequests.length})
-              </button>
-              <button
-                onClick={() => {
-                  setMessagingView("conversations");
-                  setSelectedConversation(null);
-                }}
-                className={`px-4 py-2 font-medium transition ${
-                  messagingView === "conversations"
-                    ? "border-b-2 border-blue-600 text-blue-600"
-                    : "text-gray-600 hover:text-blue-600"
-                }`}
-              >
-                Conversations ({conversations.length})
-              </button>
+            <div className="mb-6">
+              <h2 className="text-2xl font-bold text-gray-800">
+                Conversations
+              </h2>
+              <p className="mt-1 text-sm text-gray-500">
+                Your approved clinician conversations. Use Find Care to search
+                clinicians and manage requests.
+              </p>
             </div>
 
-            {/* Browse Clinicians */}
-            {messagingView === "browse" && (
-              <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
-                {clinicians.map((c) => {
-                  const hasRequest = messageRequests.find(
-                    (r) => r.clinician_email === c.email,
-                  );
-                  const isConnected = conversations.find(
-                    (conv) => conv.other_user_email === c.email,
-                  );
-
-                  return (
-                    <motion.div
-                      key={c.id}
-                      className="p-4 bg-gradient-to-br from-blue-50 to-white border border-gray-200 rounded-lg shadow-sm hover:shadow-md transition-all duration-300"
-                      whileHover={{ scale: 1.03 }}
-                    >
-                      <div className="flex items-center gap-3 mb-3">
-                        <div className="w-12 h-12 bg-blue-100 rounded-full flex items-center justify-center">
-                          <i className="fas fa-user-md text-blue-600 text-xl"></i>
-                        </div>
-                        <div>
-                          <h3 className="font-semibold text-gray-800">
-                            {c.name}
-                          </h3>
-                          <p className="text-sm text-gray-600">
-                            {c.specialization}
-                          </p>
-                        </div>
-                      </div>
-                      <p className="text-xs text-gray-500 mb-1">
-                        {c.department}
-                      </p>
-                      <p className="text-xs text-gray-500 mb-3">
-                        {c.years_of_experience} yrs experience
-                      </p>
-
-                      {isConnected ? (
-                        <button
-                          onClick={() => {
-                            setSelectedConversation(isConnected);
-                            setMessagingView("conversations");
-                            loadConversationMessages(c.email);
-                          }}
-                          className="w-full bg-green-600 text-white py-2 rounded-lg hover:bg-green-700 transition"
-                        >
-                          <i className="fas fa-comments mr-2"></i>Chat
-                        </button>
-                      ) : hasRequest ? (
-                        <button
-                          disabled
-                          className="w-full bg-gray-300 text-gray-600 py-2 rounded-lg cursor-not-allowed"
-                        >
-                          {hasRequest.status === "pending"
-                            ? "Request Pending"
-                            : hasRequest.status === "rejected"
-                              ? "Request Rejected"
-                              : "Connected"}
-                        </button>
-                      ) : (
-                        <button
-                          onClick={() => handleRequestMessage(c.email)}
-                          className="w-full bg-blue-600 text-white py-2 rounded-lg hover:bg-blue-700 transition"
-                        >
-                          <i className="fas fa-envelope mr-2"></i>Request to
-                          Message
-                        </button>
-                      )}
-                    </motion.div>
-                  );
-                })}
-                {clinicians.length === 0 && (
-                  <div className="col-span-3 text-center text-gray-500 py-8">
-                    No clinicians found.
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* My Requests */}
-            {messagingView === "requests" && (
-              <div className="space-y-3">
-                {messageRequests.length === 0 ? (
-                  <p className="text-center text-gray-500 py-8">
-                    No requests yet. Browse clinicians to send a request.
-                  </p>
-                ) : (
-                  messageRequests.map((req) => (
-                    <div
-                      key={req.id}
-                      className="flex items-center justify-between p-4 bg-blue-50 rounded-lg border border-blue-100"
-                    >
-                      <div>
-                        <h3 className="font-semibold text-gray-800">
-                          {req.clinician_name}
-                        </h3>
-                        <p className="text-sm text-gray-600">
-                          {req.clinician_specialization}
-                        </p>
-                        <p className="text-xs text-gray-500 mt-1">
-                          Requested:{" "}
-                          {new Date(req.requested_at).toLocaleDateString()}
-                        </p>
-                      </div>
-                      <span
-                        className={`px-3 py-1 rounded-full text-sm font-medium ${
-                          req.status === "pending"
-                            ? "bg-yellow-100 text-yellow-700"
-                            : req.status === "accepted"
-                              ? "bg-green-100 text-green-700"
-                              : "bg-red-100 text-red-700"
-                        }`}
-                      >
-                        {req.status}
-                      </span>
-                    </div>
-                  ))
-                )}
-              </div>
-            )}
-
             {/* Conversations List */}
-            {messagingView === "conversations" && !selectedConversation && (
+            {!selectedConversation && (
               <div className="space-y-3">
                 {conversations.length === 0 ? (
                   <p className="text-center text-gray-500 py-8">
@@ -5470,7 +5286,7 @@ const Dashboard = () => {
             )}
 
             {/* Chat View - PATIENT */}
-            {messagingView === "conversations" && selectedConversation && (
+            {selectedConversation && (
               <div className="flex flex-col h-96">
                 {/* Chat Header */}
                 <div className="flex items-center justify-between pb-3 border-b">
@@ -5732,85 +5548,18 @@ const Dashboard = () => {
             initial={{ y: 20, opacity: 0 }}
             animate={{ y: 0, opacity: 1 }}
           >
-            <h2 className="text-2xl font-bold text-gray-800 mb-4">Messages</h2>
-
-            {/* Sub Navigation */}
-            <div className="flex gap-2 mb-6 border-b">
-              <button
-                onClick={() => {
-                  setMessagingView("requests");
-                  setSelectedConversation(null);
-                }}
-                className={`px-4 py-2 font-medium transition ${
-                  messagingView === "requests"
-                    ? "border-b-2 border-blue-600 text-blue-600"
-                    : "text-gray-600 hover:text-blue-600"
-                }`}
-              >
-                Pending Requests ({messageRequests.length})
-              </button>
-              <button
-                onClick={() => {
-                  setMessagingView("conversations");
-                  setSelectedConversation(null);
-                }}
-                className={`px-4 py-2 font-medium transition ${
-                  messagingView === "conversations"
-                    ? "border-b-2 border-blue-600 text-blue-600"
-                    : "text-gray-600 hover:text-blue-600"
-                }`}
-              >
-                My Patients ({conversations.length})
-              </button>
+            <div className="mb-6">
+              <h2 className="text-2xl font-bold text-gray-800">
+                Conversations
+              </h2>
+              <p className="mt-1 text-sm text-gray-500">
+                Your connected patients. New connection requests are managed
+                from Patient Requests.
+              </p>
             </div>
 
-            {/* Pending Requests */}
-            {messagingView === "requests" && (
-              <div className="space-y-3">
-                {messageRequests.length === 0 ? (
-                  <p className="text-center text-gray-500 py-8">
-                    No pending requests.
-                  </p>
-                ) : (
-                  messageRequests.map((req) => (
-                    <div
-                      key={req.id}
-                      className="flex items-center justify-between p-4 bg-yellow-50 rounded-lg border border-yellow-100"
-                    >
-                      <div>
-                        <h3 className="font-semibold text-gray-800">
-                          {req.patient_name}
-                        </h3>
-                        <p className="text-sm text-gray-600">
-                          {req.patient_email}
-                        </p>
-                        <p className="text-xs text-gray-500 mt-1">
-                          Requested:{" "}
-                          {new Date(req.requested_at).toLocaleDateString()}
-                        </p>
-                      </div>
-                      <div className="flex gap-2">
-                        <button
-                          onClick={() => handleAcceptRequest(req.id)}
-                          className="bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700 transition"
-                        >
-                          Accept
-                        </button>
-                        <button
-                          onClick={() => handleRejectRequest(req.id)}
-                          className="bg-red-600 text-white px-4 py-2 rounded-lg hover:bg-red-700 transition"
-                        >
-                          Reject
-                        </button>
-                      </div>
-                    </div>
-                  ))
-                )}
-              </div>
-            )}
-
             {/* Conversations */}
-            {messagingView === "conversations" && !selectedConversation && (
+            {!selectedConversation && (
               <div className="space-y-3">
                 {conversations.length === 0 ? (
                   <p className="text-center text-gray-500 py-8">
@@ -5876,7 +5625,7 @@ const Dashboard = () => {
             )}
 
             {/* Chat View - CLINICIAN */}
-            {messagingView === "conversations" && selectedConversation && (
+            {selectedConversation && (
               <div className="flex flex-col h-96">
                 {/* Chat Header */}
                 <div className="flex items-center justify-between pb-3 border-b">
@@ -6166,6 +5915,20 @@ const Dashboard = () => {
               setClinicalProfileTarget(patient)
             }
             onMessagePatient={openPatientConversation}
+          />
+        )}
+        {user?.role !== "admin" && currentView === "care-team" && (
+          <CareConnections
+            user={user}
+            onOpenConversation={(conversation) => {
+              setCurrentView("messages");
+              setSelectedConversation(conversation);
+              loadConversationMessages(conversation.other_user_email);
+            }}
+            onConnectionsChanged={() => {
+              loadMessageRequests();
+              loadConversations();
+            }}
           />
         )}
         {user?.role !== "admin" && currentView === "prescriptions" && (

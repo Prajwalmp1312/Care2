@@ -21,7 +21,6 @@ const localizer = dateFnsLocalizer({
 });
 
 const WEEKDAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
-const emptyHours = () => Object.fromEntries(WEEKDAYS.map((day) => [day, []]));
 
 const calendarTypeIcons = {
   phone_call: "fa-phone",
@@ -54,14 +53,11 @@ const Appointments = ({
 }) => {
   const [appointments, setAppointments] = useState([]);
   const [clinicians, setClinicians] = useState([]);
+  const [reminders, setReminders] = useState([]);
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [availableSlots, setAvailableSlots] = useState([]);
-  const [availability, setAvailability] = useState({
-    consultation_hours: emptyHours(),
-    consultation_duration_minutes: 15,
-  });
 
   const [formData, setFormData] = useState({
     clinician_email: "",
@@ -157,20 +153,26 @@ const Appointments = ({
     }
   };
 
-  const loadAvailability = async () => {
-    if (user?.role !== "clinician") return;
+  const loadReminders = async () => {
+    if (user?.role !== "patient") {
+      setReminders([]);
+      return;
+    }
     try {
-      const res = await axios.get("/api/clinician/availability");
-      setAvailability(res.data);
+      const res = await axios.get("/api/appointment-reminders");
+      setReminders(res.data.reminders || []);
+      window.dispatchEvent(new Event("careconnect:notifications-updated"));
     } catch (err) {
-      setError(err.response?.data?.detail || "Failed to load consultation hours");
+      setError(
+        err.response?.data?.detail || "Failed to load appointment reminders",
+      );
     }
   };
 
   useEffect(() => {
     loadAppointments();
     loadClinicians();
-    loadAvailability();
+    loadReminders();
   }, [user?.role]);
 
   useEffect(() => {
@@ -263,40 +265,6 @@ const Appointments = ({
     }
   };
 
-  const toggleAvailabilityDay = (day, enabled) => {
-    setAvailability((current) => ({
-      ...current,
-      consultation_hours: {
-        ...current.consultation_hours,
-        [day]: enabled ? [{ start: "09:00", end: "17:00" }] : [],
-      },
-    }));
-  };
-
-  const updateAvailabilityTime = (day, field, value) => {
-    setAvailability((current) => ({
-      ...current,
-      consultation_hours: {
-        ...current.consultation_hours,
-        [day]: [{ ...(current.consultation_hours[day]?.[0] || {}), [field]: value }],
-      },
-    }));
-  };
-
-  const saveAvailability = async () => {
-    setMessage(""); setError("");
-    try {
-      setLoading(true);
-      const res = await axios.put("/api/clinician/availability", availability);
-      setAvailability(res.data);
-      setMessage("Consultation hours updated successfully");
-    } catch (err) {
-      setError(err.response?.data?.detail || "Failed to update consultation hours");
-    } finally {
-      setLoading(false);
-    }
-  };
-
   const updateAppointmentStatus = async (appointmentId, status) => {
     setMessage("");
     setError("");
@@ -317,6 +285,7 @@ const Appointments = ({
 
       setMessage(`Appointment ${status} successfully`);
       await loadAppointments();
+      await loadReminders();
     } catch (err) {
       setError(err.response?.data?.detail || "Failed to update appointment");
     } finally {
@@ -481,30 +450,69 @@ const Appointments = ({
         </div>
       )}
 
-      {user?.role === "clinician" && (
-        <div className="bg-white rounded-xl shadow-md p-6 border border-gray-100">
-          <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between mb-5">
+      {user?.role === "patient" && (
+        <div className="rounded-xl border border-blue-100 bg-gradient-to-r from-blue-50 to-indigo-50 p-5 shadow-sm">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div>
-              <h3 className="text-xl font-bold text-gray-800">Consultation Hours</h3>
-              <p className="text-sm text-gray-500">Patients can only request appointments during these hours.</p>
+              <h3 className="flex items-center gap-2 text-lg font-bold text-slate-900">
+                <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-blue-600 text-white">
+                  <i className="fas fa-bell"></i>
+                </span>
+                Appointment reminders
+              </h3>
+              <p className="mt-1 text-sm text-slate-600">
+                Approved visits receive automatic in-app reminders 24 hours
+                and 1 hour before the scheduled time.
+              </p>
             </div>
-            <label className="text-sm font-semibold text-gray-700">
-              Slot duration
-              <select value={availability.consultation_duration_minutes} onChange={(e) => setAvailability((current) => ({ ...current, consultation_duration_minutes: Number(e.target.value) }))} className="ml-2 border rounded-lg px-3 py-2">
-                {[15, 30, 45, 60].map((minutes) => <option key={minutes} value={minutes}>{minutes} minutes</option>)}
-              </select>
-            </label>
+            <span className="rounded-full bg-white px-3 py-1 text-xs font-bold text-blue-700 ring-1 ring-blue-200">
+              <i className="fas fa-clock mr-1"></i>
+              Automatic
+            </span>
           </div>
-          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-            {WEEKDAYS.map((day) => {
-              const interval = availability.consultation_hours?.[day]?.[0];
-              return <div key={day} className="rounded-lg border p-3">
-                <label className="flex items-center gap-2 font-semibold capitalize"><input type="checkbox" checked={Boolean(interval)} onChange={(e) => toggleAvailabilityDay(day, e.target.checked)} />{day}</label>
-                {interval && <div className="mt-3 flex items-center gap-2"><input type="time" value={interval.start} onChange={(e) => updateAvailabilityTime(day, "start", e.target.value)} className="min-w-0 border rounded px-2 py-1" /><span>to</span><input type="time" value={interval.end} onChange={(e) => updateAvailabilityTime(day, "end", e.target.value)} className="min-w-0 border rounded px-2 py-1" /></div>}
-              </div>;
-            })}
-          </div>
-          <button type="button" onClick={saveAvailability} disabled={loading} className="mt-5 bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-lg font-semibold disabled:opacity-50">Save Consultation Hours</button>
+
+          {reminders.length > 0 ? (
+            <div className="mt-4 grid gap-3 md:grid-cols-2">
+              {reminders.slice(0, 6).map((reminder) => (
+                <div
+                  key={reminder.id}
+                  className="rounded-lg border border-white bg-white/90 p-3"
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <p className="font-semibold text-slate-800">
+                        {reminder.clinician_name}
+                      </p>
+                      <p className="text-sm text-slate-600">
+                        {reminder.appointment_date} at{" "}
+                        {reminder.appointment_time}
+                      </p>
+                      <p className="mt-1 text-xs text-slate-500">
+                        {reminder.reminder_type === "24_hour"
+                          ? "24-hour reminder"
+                          : "1-hour reminder"}{" "}
+                        · {reminder.appointment_timezone}
+                      </p>
+                    </div>
+                    <span
+                      className={`rounded-full px-2 py-1 text-xs font-bold ${
+                        reminder.status === "sent"
+                          ? "bg-emerald-100 text-emerald-700"
+                          : "bg-blue-100 text-blue-700"
+                      }`}
+                    >
+                      {reminder.status === "sent" ? "Sent" : "Scheduled"}
+                    </span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="mt-4 rounded-lg border border-dashed border-blue-200 bg-white/60 p-4 text-sm text-slate-600">
+              Reminder schedules will appear here after a clinician approves
+              an upcoming appointment.
+            </p>
+          )}
         </div>
       )}
 
@@ -537,7 +545,45 @@ const Appointments = ({
               {formData.clinician_email && (() => {
                 const clinician = clinicians.find((item) => item.email === formData.clinician_email);
                 const activeDays = WEEKDAYS.filter((day) => clinician?.consultation_hours?.[day]?.length);
-                return <p className="mt-2 text-sm text-blue-700">{activeDays.length ? `Available: ${activeDays.map((day) => `${day.slice(0, 3)} ${clinician.consultation_hours[day][0].start}-${clinician.consultation_hours[day][0].end}`).join(", ")}` : "This clinician has not published consultation hours yet."}</p>;
+                if (!activeDays.length) {
+                  return (
+                    <p className="mt-2 text-sm text-blue-700">
+                      This clinician has not published consultation hours yet.
+                    </p>
+                  );
+                }
+                const hoursSummary = activeDays
+                  .map(
+                    (day) =>
+                      `${day.slice(0, 3)} ${clinician.consultation_hours[
+                        day
+                      ]
+                        .map((window) => `${window.start}-${window.end}`)
+                        .join(" / ")}`,
+                  )
+                  .join(", ");
+                const breakSummary = activeDays
+                  .flatMap((day) =>
+                    (clinician.consultation_breaks?.[day] || []).map(
+                      (item) =>
+                        `${day.slice(0, 3)} ${item.label} ${item.start}-${item.end}`,
+                    ),
+                  )
+                  .join(", ");
+                return (
+                  <div className="mt-2 rounded-lg bg-blue-50 px-3 py-2 text-sm text-blue-800">
+                    <p>
+                      <span className="font-semibold">Available:</span>{" "}
+                      {hoursSummary}
+                    </p>
+                    {breakSummary && (
+                      <p className="mt-1 text-xs text-amber-800">
+                        <span className="font-semibold">Unavailable:</span>{" "}
+                        {breakSummary}
+                      </p>
+                    )}
+                  </div>
+                );
               })()}
             </div>
 
@@ -684,7 +730,12 @@ const Appointments = ({
           </h3>
 
           <button
-            onClick={loadAppointments}
+            onClick={() => {
+              loadAppointments();
+              if (user?.role === "patient") {
+                loadReminders();
+              }
+            }}
             className="bg-gray-100 hover:bg-gray-200 text-gray-700 px-4 py-2 rounded-lg font-medium"
           >
             <i className="fas fa-sync-alt mr-2"></i>
