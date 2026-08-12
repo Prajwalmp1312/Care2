@@ -1,11 +1,11 @@
-import React from 'react';
-import { useNavigate } from 'react-router-dom';
+import React from "react";
+import { useNavigate } from "react-router-dom";
 
 const Landing = () => {
   const navigate = useNavigate();
 
   const handleRoleSelect = (role) => {
-    navigate('/register', { state: { preselectedRole: role } });
+    navigate("/register", { state: { preselectedRole: role } });
   };
 
   return (
@@ -18,20 +18,32 @@ const Landing = () => {
               <i className="fas fa-heartbeat text-white text-xl"></i>
             </div>
             <div>
-              <h1 className="text-xl font-bold text-gray-800">CareConnect Pro</h1>
-              <p className="text-xs text-gray-600">Healthcare Communication Platform</p>
+              <h1 className="text-xl font-bold text-gray-800">
+                CareConnect Pro
+              </h1>
+              <p className="text-xs text-gray-600">
+                Healthcare Communication Platform
+              </p>
             </div>
           </div>
-          
+
+          {/* <button
+            onClick={() => navigate("/admin")}
+            className="px-4 py-2 text-purple-600 hover:text-purple-700 font-semibold transition"
+          >
+            <i className="fas fa-shield-alt mr-2"></i>
+            Admin Portal
+          </button> */}
+
           <div className="flex items-center gap-3">
             <button
-              onClick={() => navigate('/login')}
+              onClick={() => navigate("/login")}
               className="px-6 py-2 text-blue-600 hover:text-blue-700 font-semibold transition"
             >
               Login
             </button>
             <button
-              onClick={() => navigate('/register')}
+              onClick={() => navigate("/register")}
               className="px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-semibold transition"
             >
               Register
@@ -46,23 +58,24 @@ const Landing = () => {
           Welcome to CareConnect Pro
         </h2>
         <p className="text-xl text-gray-600 mb-12 max-w-3xl mx-auto">
-          Seamless healthcare communication platform connecting patients, clinicians, and administrators.
-          Choose your role to get started.
+          Seamless healthcare communication platform connecting patients,
+          clinicians, and administrators. Choose your role to get started.
         </p>
 
         {/* Role Selection Cards */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-8 mt-16 max-w-5xl mx-auto">
           {/* Patient Card */}
-          <div 
+          <div
             className="bg-white rounded-2xl shadow-xl p-8 hover:shadow-2xl transition-all hover:-translate-y-2 cursor-pointer group"
-            onClick={() => handleRoleSelect('patient')}
+            onClick={() => handleRoleSelect("patient")}
           >
             <div className="w-20 h-20 bg-blue-100 rounded-full flex items-center justify-center mx-auto mb-6 group-hover:bg-blue-600 transition">
               <i className="fas fa-user text-4xl text-blue-600 group-hover:text-white transition"></i>
             </div>
             <h3 className="text-2xl font-bold text-gray-800 mb-4">Patient</h3>
             <p className="text-gray-600 mb-6">
-              Access your health records, communicate with your healthcare providers, and manage appointments.
+              Access your health records, communicate with your healthcare
+              providers, and manage appointments.
             </p>
             <ul className="text-left space-y-2 text-sm text-gray-600 mb-6">
               <li className="flex items-center gap-2">
@@ -88,16 +101,17 @@ const Landing = () => {
           </div>
 
           {/* Clinician Card */}
-          <div 
+          <div
             className="bg-white rounded-2xl shadow-xl p-8 hover:shadow-2xl transition-all hover:-translate-y-2 cursor-pointer group"
-            onClick={() => handleRoleSelect('clinician')}
+            onClick={() => handleRoleSelect("clinician")}
           >
             <div className="w-20 h-20 bg-indigo-100 rounded-full flex items-center justify-center mx-auto mb-6 group-hover:bg-indigo-600 transition">
               <i className="fas fa-user-md text-4xl text-indigo-600 group-hover:text-white transition"></i>
             </div>
             <h3 className="text-2xl font-bold text-gray-800 mb-4">Clinician</h3>
             <p className="text-gray-600 mb-6">
-              Manage patient care, access medical records, and collaborate with your healthcare team.
+              Manage patient care, access medical records, and collaborate with
+              your healthcare team.
             </p>
             <ul className="text-left space-y-2 text-sm text-gray-600 mb-6">
               <li className="flex items-center gap-2">
@@ -118,14 +132,14 @@ const Landing = () => {
               </li>
             </ul>
             <button
-              onClick={() => navigate('/clinician-join')}
+              onClick={() => navigate("/clinician-join")}
               className="px-6 py-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-semibold transition"
-              >
+            >
               Apply to Join as Clinician
             </button>
           </div>
 
-           {/* Admin Card */}
+          {/* Admin Card */}
           {/* <div 
             className="bg-white rounded-2xl shadow-xl p-8 hover:shadow-2xl transition-all hover:-translate-y-2 cursor-pointer group"
             onClick={() => handleRoleSelect('admin')}
@@ -159,7 +173,6 @@ const Landing = () => {
               Join as Admin
             </button>
           </div> */}
-
         </div>
       </section>
 
@@ -169,38 +182,54 @@ const Landing = () => {
           <h3 className="text-3xl font-bold text-gray-800 text-center mb-12">
             Why Choose CareConnect Pro?
           </h3>
-          
+
           <div className="grid grid-cols-1 md:grid-cols-4 gap-8">
             <div className="text-center">
               <div className="w-16 h-16 bg-blue-100 rounded-full flex items-center justify-center mx-auto mb-4">
                 <i className="fas fa-lock text-2xl text-blue-600"></i>
               </div>
-              <h4 className="text-lg font-semibold text-gray-800 mb-2">Secure & Private</h4>
-              <p className="text-sm text-gray-600">End-to-end encryption for all communications</p>
+              <h4 className="text-lg font-semibold text-gray-800 mb-2">
+                Secure & Private
+              </h4>
+              <p className="text-sm text-gray-600">
+                End-to-end encryption for all communications
+              </p>
             </div>
 
             <div className="text-center">
               <div className="w-16 h-16 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-4">
                 <i className="fas fa-clock text-2xl text-green-600"></i>
               </div>
-              <h4 className="text-lg font-semibold text-gray-800 mb-2">24/7 Access</h4>
-              <p className="text-sm text-gray-600">Access your health information anytime, anywhere</p>
+              <h4 className="text-lg font-semibold text-gray-800 mb-2">
+                24/7 Access
+              </h4>
+              <p className="text-sm text-gray-600">
+                Access your health information anytime, anywhere
+              </p>
             </div>
 
             <div className="text-center">
               <div className="w-16 h-16 bg-purple-100 rounded-full flex items-center justify-center mx-auto mb-4">
                 <i className="fas fa-comments text-2xl text-purple-600"></i>
               </div>
-              <h4 className="text-lg font-semibold text-gray-800 mb-2">Real-time Communication</h4>
-              <p className="text-sm text-gray-600">Secure messaging between all healthcare stakeholders</p>
+              <h4 className="text-lg font-semibold text-gray-800 mb-2">
+                Real-time Communication
+              </h4>
+              <p className="text-sm text-gray-600">
+                Secure messaging between all healthcare stakeholders
+              </p>
             </div>
 
             <div className="text-center">
               <div className="w-16 h-16 bg-orange-100 rounded-full flex items-center justify-center mx-auto mb-4">
                 <i className="fas fa-file-medical-alt text-2xl text-orange-600"></i>
               </div>
-              <h4 className="text-lg font-semibold text-gray-800 mb-2">Digital Records</h4>
-              <p className="text-sm text-gray-600">All your medical records in one secure place</p>
+              <h4 className="text-lg font-semibold text-gray-800 mb-2">
+                Digital Records
+              </h4>
+              <p className="text-sm text-gray-600">
+                All your medical records in one secure place
+              </p>
             </div>
           </div>
         </div>
@@ -209,19 +238,22 @@ const Landing = () => {
       {/* CTA Section */}
       <section className="bg-gradient-to-r from-blue-600 to-indigo-600 py-16">
         <div className="max-w-4xl mx-auto px-4 text-center text-white">
-          <h3 className="text-3xl font-bold mb-4">Ready to Transform Your Healthcare Experience?</h3>
+          <h3 className="text-3xl font-bold mb-4">
+            Ready to Transform Your Healthcare Experience?
+          </h3>
           <p className="text-xl mb-8 opacity-90">
-            Join thousands of patients and healthcare providers on CareConnect Pro
+            Join thousands of patients and healthcare providers on CareConnect
+            Pro
           </p>
           <div className="flex gap-4 justify-center flex-wrap">
             <button
-              onClick={() => navigate('/register')}
+              onClick={() => navigate("/register")}
               className="px-8 py-4 bg-white text-blue-600 rounded-lg font-bold text-lg hover:bg-gray-100 transition"
             >
               Get Started Free
             </button>
             <button
-              onClick={() => navigate('/login')}
+              onClick={() => navigate("/login")}
               className="px-8 py-4 bg-transparent border-2 border-white text-white rounded-lg font-bold text-lg hover:bg-white/10 transition"
             >
               Sign In
@@ -239,8 +271,12 @@ const Landing = () => {
             </div>
             <span className="text-white font-bold">CareConnect Pro</span>
           </div>
-          <p className="text-sm">© 2025 B360u Healthcare Platform. All rights reserved.</p>
-          <p className="text-xs mt-2">HIPAA Compliant | Secure | Trusted by Healthcare Professionals</p>
+          <p className="text-sm">
+            © 2025 B360u Healthcare Platform. All rights reserved.
+          </p>
+          <p className="text-xs mt-2">
+            HIPAA Compliant | Secure | Trusted by Healthcare Professionals
+          </p>
         </div>
       </footer>
     </div>

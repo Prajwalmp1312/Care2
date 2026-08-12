@@ -44,3 +44,23 @@ body {
 .rbc-today {
   background-color: #eff6ff;
 }
+
+@media (max-width: 768px) {
+  .dashboard-responsive .max-w-7xl {
+    max-width: 100% !important;
+    padding-left: 1rem !important;
+    padding-right: 1rem !important;
+  }
+
+  .dashboard-responsive .grid-cols-2,
+  .dashboard-responsive .grid-cols-3,
+  .dashboard-responsive .grid-cols-4,
+  .dashboard-responsive .grid-cols-5,
+  .dashboard-responsive .grid-cols-6 {
+    grid-template-columns: repeat(1, minmax(0, 1fr)) !important;
+  }
+
+  .dashboard-responsive .flex {
+    flex-wrap: wrap;
+  }
+}

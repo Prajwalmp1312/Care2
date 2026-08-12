@@ -20,11 +20,11 @@ const AIReportComparison = ({ records = [] }) => {
   }, [records]);
 
   const selectedFirstRecord = comparableRecords.find(
-    (record) => String(record.id) === String(firstRecordId)
+    (record) => String(record.id) === String(firstRecordId),
   );
 
   const selectedSecondRecord = comparableRecords.find(
-    (record) => String(record.id) === String(secondRecordId)
+    (record) => String(record.id) === String(secondRecordId),
   );
 
   const compareReports = async () => {
@@ -55,7 +55,7 @@ const AIReportComparison = ({ records = [] }) => {
           headers: {
             Authorization: `Bearer ${token}`,
           },
-        }
+        },
       );
 
       setComparison(res.data);
@@ -96,7 +96,10 @@ const AIReportComparison = ({ records = [] }) => {
         ["Improved items", ...(comparison.improved_items || [])],
         ["Worsened items", ...(comparison.worsened_items || [])],
         ["New concerns", ...(comparison.new_concerns || [])],
-        ["Recommended next steps", ...(comparison.recommended_next_steps || [])],
+        [
+          "Recommended next steps",
+          ...(comparison.recommended_next_steps || []),
+        ],
       ];
       content = rows.map((row) => row.map(escapeCsv).join(",")).join("\r\n");
       mediaType = "text/csv";
@@ -122,7 +125,9 @@ const AIReportComparison = ({ records = [] }) => {
           {items.map((item, index) => (
             <li key={index} className="flex items-start gap-2">
               <span className="text-blue-600 mt-1">•</span>
-              <span>{typeof item === "string" ? item : JSON.stringify(item)}</span>
+              <span>
+                {typeof item === "string" ? item : JSON.stringify(item)}
+              </span>
             </li>
           ))}
         </ul>
@@ -217,7 +222,8 @@ const AIReportComparison = ({ records = [] }) => {
             AI Report Comparison
           </h3>
           <p className="text-sm text-gray-600 mt-1">
-            Select two medical records and compare changes using extracted report data.
+            Select two medical records and compare changes using extracted
+            report data.
           </p>
         </div>
 
@@ -245,7 +251,10 @@ const AIReportComparison = ({ records = [] }) => {
                 <option value="">Select first report</option>
                 {comparableRecords.map((record) => (
                   <option key={record.id} value={record.id}>
-                    {record.name} — {record.uploaded_at ? new Date(record.uploaded_at).toLocaleDateString() : "No date"}
+                    {record.name} —{" "}
+                    {record.uploaded_at
+                      ? new Date(record.uploaded_at).toLocaleDateString()
+                      : "No date"}
                   </option>
                 ))}
               </select>
@@ -269,7 +278,10 @@ const AIReportComparison = ({ records = [] }) => {
                 <option value="">Select second report</option>
                 {comparableRecords.map((record) => (
                   <option key={record.id} value={record.id}>
-                    {record.name} — {record.uploaded_at ? new Date(record.uploaded_at).toLocaleDateString() : "No date"}
+                    {record.name} —{" "}
+                    {record.uploaded_at
+                      ? new Date(record.uploaded_at).toLocaleDateString()
+                      : "No date"}
                   </option>
                 ))}
               </select>
@@ -316,34 +328,104 @@ const AIReportComparison = ({ records = [] }) => {
       {comparison && (
         <div className="mt-8 space-y-6">
           <div className="bg-gradient-to-r from-indigo-600 to-purple-600 text-white rounded-xl p-6">
-            <div className="mb-2 flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center justify-between gap-4 mb-4">
               <h4 className="text-lg font-bold">Comparison Summary</h4>
-              <div className="flex gap-2">
-                <button
-                  type="button"
-                  onClick={() => exportComparison("csv")}
-                  className="rounded-lg bg-white/15 px-3 py-2 text-xs font-bold hover:bg-white/25"
-                >
-                  <i className="fas fa-download mr-2"></i>CSV
-                </button>
-                <button
-                  type="button"
-                  onClick={() => exportComparison("json")}
-                  className="rounded-lg bg-white/15 px-3 py-2 text-xs font-bold hover:bg-white/25"
-                >
-                  <i className="fas fa-download mr-2"></i>JSON
-                </button>
-              </div>
-            </div>
-            <p className="text-sm leading-6">
-              {comparison.ai_summary || comparison.summary}
-            </p>
 
-            {comparison.patient_friendly_explanation && (
-              <p className="text-sm leading-6 mt-4 bg-white/10 p-4 rounded-lg">
-                {comparison.patient_friendly_explanation}
+              <span className="bg-white/20 px-3 py-1 rounded-full text-xs font-bold">
+                {comparison.metric_comparison?.length || 0} Metrics Compared
+              </span>
+            </div>
+
+            {/* <p className="text-sm leading-7 mb-4">
+              {comparison.ai_summary || comparison.summary}
+            </p> */}
+
+            {comparison.comparison_points?.length > 0 && (
+              <div className="bg-white/10 p-4 rounded-lg mt-4">
+                <h5 className="font-bold mb-3">Point-wise Comparison</h5>
+
+                <ul className="space-y-2 text-sm leading-6 list-disc pl-5">
+                  {comparison.comparison_points.map((point, index) => (
+                    <li key={index}>{point}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+              {/* {comparison.metric_comparison?.length > 0 && (
+                <p className="text-sm leading-7 bg-white/10 p-4 rounded-lg mb-4">
+                  {comparison.metric_comparison
+                    .filter((metric) =>
+                      [
+                        "increased",
+                        "decreased",
+                        "changed",
+                        "new",
+                        "removed",
+                      ].includes(metric.status),
+                    )
+                    .map((metric) => {
+                      const metricName = formatLabel(metric.metric);
+
+                      if (metric.status === "increased") {
+                        return `${metricName} increased from ${metric.first_value ?? "N/A"} to ${metric.second_value ?? "N/A"}.`;
+                      }
+
+                      if (metric.status === "decreased") {
+                        return `${metricName} decreased from ${metric.first_value ?? "N/A"} to ${metric.second_value ?? "N/A"}.`;
+                      }
+
+                      if (metric.status === "changed") {
+                        return `${metricName} changed from ${metric.first_value ?? "N/A"} to ${metric.second_value ?? "N/A"}.`;
+                      }
+
+                      if (metric.status === "new") {
+                        return `${metricName} is newly present in the second report with value ${metric.second_value ?? "N/A"}.`;
+                      }
+
+                      if (metric.status === "removed") {
+                        return `${metricName} was present in the first report but is missing in the second report.`;
+                      }
+
+                      return "";
+                    })
+                    .filter(Boolean)
+                    .join(" ")}
+                </p>
+              )} */}
+{/* 
+            {comparison.new_concerns?.length > 0 && (
+              <p className="text-sm leading-7 bg-white/10 p-4 rounded-lg mb-4">
+                New concerns found in the second report:{" "}
+                {comparison.new_concerns.join("; ")}.
+              </p>
+            )} */}
+
+            {/* {comparison.resolved_findings?.length > 0 && (
+              <p className="text-sm leading-7 bg-white/10 p-4 rounded-lg mb-4">
+                Findings present in the first report but not in the second
+                report: {comparison.resolved_findings.join("; ")}.
+              </p>
+            )} */}
+
+            {/* {comparison.stable_items?.length > 0 && (
+              <p className="text-sm leading-7 bg-white/10 p-4 rounded-lg mb-4">
+                Stable findings across both reports:{" "}
+                {comparison.stable_items.join("; ")}.
               </p>
             )}
+
+            {comparison.recommended_next_steps?.length > 0 && (
+              <p className="text-sm leading-7 bg-white/10 p-4 rounded-lg">
+                Recommended next steps:{" "}
+                {comparison.recommended_next_steps.join(" ")}
+              </p>
+            )} */}
+
+            <p className="text-xs leading-6 mt-5 bg-yellow-300/20 border border-yellow-200/40 rounded-lg p-4">
+              Note: This comparison is AI-assisted and should be reviewed by a
+              qualified healthcare professional.
+            </p>
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -353,12 +435,15 @@ const AIReportComparison = ({ records = [] }) => {
                 {comparison.first_record?.name}
               </p>
               <p className="text-sm text-gray-600">
-                {comparison.first_record?.category} • {comparison.first_record?.type}
+                {comparison.first_record?.category} •{" "}
+                {comparison.first_record?.type}
               </p>
               <p className="text-xs text-gray-500 mt-1">
                 Uploaded:{" "}
                 {comparison.first_record?.uploaded_at
-                  ? new Date(comparison.first_record.uploaded_at).toLocaleString()
+                  ? new Date(
+                      comparison.first_record.uploaded_at,
+                    ).toLocaleString()
                   : "N/A"}
               </p>
             </div>
@@ -369,21 +454,24 @@ const AIReportComparison = ({ records = [] }) => {
                 {comparison.second_record?.name}
               </p>
               <p className="text-sm text-gray-600">
-                {comparison.second_record?.category} • {comparison.second_record?.type}
+                {comparison.second_record?.category} •{" "}
+                {comparison.second_record?.type}
               </p>
               <p className="text-xs text-gray-500 mt-1">
                 Uploaded:{" "}
                 {comparison.second_record?.uploaded_at
-                  ? new Date(comparison.second_record.uploaded_at).toLocaleString()
+                  ? new Date(
+                      comparison.second_record.uploaded_at,
+                    ).toLocaleString()
                   : "N/A"}
               </p>
             </div>
           </div>
 
-          {renderMetricTable()}
+          {/* {renderMetricTable()} */}
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {renderList(
+          {/* <div className="grid grid-cols-1 md:grid-cols-2 gap-4"> */}
+          {/* {renderList(
               "Improved Items",
               comparison.improved_items,
               "fa-arrow-trend-up text-green-600",
@@ -417,11 +505,12 @@ const AIReportComparison = ({ records = [] }) => {
             comparison.recommended_next_steps,
             "fa-list-check text-indigo-600",
             "No next steps generated."
-          )}
+          )} */}
 
           <div className="bg-yellow-50 border border-yellow-200 text-yellow-800 rounded-lg p-4 text-sm">
-            <strong>Medical disclaimer:</strong> This AI comparison is for informational purposes only.
-            Always consult a qualified healthcare professional for diagnosis, treatment, or medication changes.
+            <strong>Medical disclaimer:</strong> This AI comparison is for
+            informational purposes only. Always consult a qualified healthcare
+            professional for diagnosis, treatment, or medication changes.
           </div>
         </div>
       )}

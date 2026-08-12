@@ -1191,6 +1191,422 @@ def compare_metrics(first_metrics, second_metrics):
 
     return comparison
 
+def extract_blood_report_metrics_from_text(text_value: str):
+    if not text_value:
+        return {}
+
+    text_value = str(text_value)
+
+    patterns = {
+        "hemoglobin": r"(?:Hemoglobin|Hb)\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?)",
+        "wbc": r"(?:WBC|White Blood Cells|White Blood Cell Count)\s*[:\-]?\s*([0-9,]+(?:\.[0-9]+)?)",
+        "rbc": r"(?:RBC|Red Blood Cells|Red Blood Cell Count)\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?)",
+        "platelets": r"(?:Platelets|Platelet Count)\s*[:\-]?\s*([0-9,]+(?:\.[0-9]+)?)",
+        "esr": r"(?:ESR)\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?)",
+        "glucose": r"(?:Glucose|Blood Sugar|Fasting Glucose)\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?)",
+        "cholesterol": r"(?:Cholesterol|Total Cholesterol)\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?)",
+        "vitamin_d": r"(?:Vitamin D|25-OH Vitamin D)\s*[:\-]?\s*([0-9]+(?:\.[0-9]+)?)",
+    }
+
+    extracted = {}
+
+    for key, pattern in patterns.items():
+        match = re.search(pattern, text_value, re.IGNORECASE)
+
+        if match:
+            extracted[key] = match.group(1).replace(",", "")
+
+    return extracted
+
+
+import re
+import json
+
+
+def safe_json_loads(value, fallback):
+    try:
+        if not value:
+            return fallback
+        if isinstance(value, (dict, list)):
+            return value
+        return json.loads(value)
+    except Exception:
+        return fallback
+
+
+def normalize_metric_value(value):
+    """
+    Converts metric values into comparable format.
+    Examples:
+    124/82 -> 124.82
+    7/10 -> 7
+    18 ml -> 18
+    4.8 mm -> 4.8
+    Positive/Negative remains text
+    """
+    if value is None:
+        return None
+
+    value = str(value).strip()
+
+    # BP special handling: 124/82 -> 124.82
+    bp_match = re.match(r"^(\d{2,3})\s*/\s*(\d{2,3})$", value)
+    if bp_match:
+        systolic = bp_match.group(1)
+        diastolic = bp_match.group(2)
+        return float(f"{systolic}.{diastolic}")
+
+    # Score format: 7/10, 68/100, 4/5 -> take first value
+    score_match = re.match(r"^(\d+(?:\.\d+)?)\s*/\s*\d+(?:\.\d+)?$", value)
+    if score_match:
+        return float(score_match.group(1))
+
+    # Range of motion: 0° to 130° -> take second value as useful improvement value
+    rom_match = re.search(r"to\s*(\d+(?:\.\d+)?)", value, re.IGNORECASE)
+    if rom_match:
+        return float(rom_match.group(1))
+
+    # Extract first number from value
+    number_match = re.search(r"-?\d+(?:\.\d+)?", value.replace(",", ""))
+    if number_match:
+        return float(number_match.group(0))
+
+    return value.lower()
+
+
+def extract_medical_report_metrics_from_text(text_value: str):
+    """
+    Generic extractor for different medical reports:
+    - Knee / orthopedic reports
+    - Blood reports
+    - Diabetes reports
+    - Lipid profile
+    - Thyroid reports
+    - Liver function test
+    - Kidney function test
+    - Vitals
+    - General medical reports
+
+    Important:
+    It reads line-by-line, so Blood Pressure will not accidentally capture
+    Knee Stability Score or Functional Mobility Score.
+    """
+
+    if not text_value:
+        return {}
+
+    text_value = str(text_value)
+    metrics = {}
+
+    patterns = {
+        # -------------------------
+        # VITAL SIGNS
+        # -------------------------
+        "blood_pressure": r"^\s*Blood Pressure\s*:\s*([0-9]{2,3}\s*/\s*[0-9]{2,3})\s*(?:mmHg)?\s*$",
+        "heart_rate": r"^\s*(?:Heart Rate|Pulse Rate|Pulse)\s*:\s*([0-9]{2,3})\s*(?:bpm)?\s*$",
+        "temperature": r"^\s*Temperature\s*:\s*([0-9]{2,3}(?:\.[0-9]+)?)\s*(?:°F|F|°C|C)?\s*$",
+        "spo2": r"^\s*(?:SpO2|Oxygen Saturation)\s*:\s*([0-9]{2,3})\s*%?\s*$",
+        "respiratory_rate": r"^\s*(?:Respiratory Rate|RR)\s*:\s*([0-9]{1,3})\s*(?:breaths/min)?\s*$",
+
+        # -------------------------
+        # BLOOD / CBC REPORT
+        # -------------------------
+        "hemoglobin": r"^\s*(?:Hemoglobin|Hb)\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:g/dL|gm/dL)?\s*$",
+        "wbc": r"^\s*(?:WBC|White Blood Cells|White Blood Cell Count|Total Leukocyte Count|TLC)\s*:\s*([0-9,]+(?:\.[0-9]+)?)\s*(?:cells/µL|cells/uL|/µL|/uL|/cumm)?\s*$",
+        "rbc": r"^\s*(?:RBC|Red Blood Cells|Red Blood Cell Count)\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:million/µL|million/uL|million/cumm)?\s*$",
+        "platelets": r"^\s*(?:Platelets|Platelet Count)\s*:\s*([0-9,]+(?:\.[0-9]+)?)\s*(?:/µL|/uL|/cumm)?\s*$",
+        "esr": r"^\s*(?:ESR|Erythrocyte Sedimentation Rate)\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:mm/hr)?\s*$",
+        "neutrophils": r"^\s*Neutrophils\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*%?\s*$",
+        "lymphocytes": r"^\s*Lymphocytes\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*%?\s*$",
+        "monocytes": r"^\s*Monocytes\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*%?\s*$",
+        "eosinophils": r"^\s*Eosinophils\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*%?\s*$",
+
+        # -------------------------
+        # DIABETES / GLUCOSE
+        # -------------------------
+        "fasting_glucose": r"^\s*(?:Fasting Glucose|Fasting Blood Sugar|FBS)\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:mg/dL)?\s*$",
+        "postprandial_glucose": r"^\s*(?:Postprandial Glucose|Post Prandial Blood Sugar|PPBS)\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:mg/dL)?\s*$",
+        "random_glucose": r"^\s*(?:Random Glucose|Random Blood Sugar|RBS)\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:mg/dL)?\s*$",
+        "hba1c": r"^\s*(?:HbA1c|A1C|Glycated Hemoglobin)\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*%?\s*$",
+
+        # -------------------------
+        # LIPID PROFILE
+        # -------------------------
+        "total_cholesterol": r"^\s*(?:Total Cholesterol|Cholesterol)\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:mg/dL)?\s*$",
+        "hdl": r"^\s*(?:HDL|HDL Cholesterol)\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:mg/dL)?\s*$",
+        "ldl": r"^\s*(?:LDL|LDL Cholesterol)\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:mg/dL)?\s*$",
+        "triglycerides": r"^\s*Triglycerides\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:mg/dL)?\s*$",
+        "vldl": r"^\s*(?:VLDL|VLDL Cholesterol)\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:mg/dL)?\s*$",
+
+        # -------------------------
+        # THYROID
+        # -------------------------
+        "tsh": r"^\s*(?:TSH|Thyroid Stimulating Hormone)\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:µIU/mL|uIU/mL)?\s*$",
+        "t3": r"^\s*(?:T3|Triiodothyronine)\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:ng/dL)?\s*$",
+        "t4": r"^\s*(?:T4|Thyroxine)\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:µg/dL|ug/dL)?\s*$",
+
+        # -------------------------
+        # LIVER FUNCTION TEST
+        # -------------------------
+        "sgpt_alt": r"^\s*(?:SGPT|ALT)\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:U/L)?\s*$",
+        "sgot_ast": r"^\s*(?:SGOT|AST)\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:U/L)?\s*$",
+        "bilirubin_total": r"^\s*(?:Total Bilirubin|Bilirubin Total)\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:mg/dL)?\s*$",
+        "albumin": r"^\s*Albumin\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:g/dL)?\s*$",
+        "alkaline_phosphatase": r"^\s*(?:Alkaline Phosphatase|ALP)\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:U/L)?\s*$",
+
+        # -------------------------
+        # KIDNEY FUNCTION TEST
+        # -------------------------
+        "creatinine": r"^\s*Creatinine\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:mg/dL)?\s*$",
+        "urea": r"^\s*(?:Urea|Blood Urea)\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:mg/dL)?\s*$",
+        "bun": r"^\s*(?:BUN|Blood Urea Nitrogen)\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:mg/dL)?\s*$",
+        "uric_acid": r"^\s*Uric Acid\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:mg/dL)?\s*$",
+
+        # -------------------------
+        # VITAMINS / MINERALS
+        # -------------------------
+        "vitamin_d": r"^\s*(?:Vitamin D|25-OH Vitamin D)\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:ng/mL)?\s*$",
+        "vitamin_b12": r"^\s*(?:Vitamin B12|B12)\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:pg/mL)?\s*$",
+        "calcium": r"^\s*Calcium\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:mg/dL)?\s*$",
+        "iron": r"^\s*Iron\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:µg/dL|ug/dL)?\s*$",
+        "ferritin": r"^\s*Ferritin\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:ng/mL)?\s*$",
+
+        # -------------------------
+        # KNEE / ORTHOPEDIC REPORT
+        # -------------------------
+        "pain_score": r"^\s*Pain Score\s*:\s*([0-9]+)\s*/\s*10\s*$",
+        "joint_effusion": r"^\s*Joint Effusion\s*:\s*([0-9]+)\s*ml\s*(?:estimated)?\s*$",
+        "acl_fiber_disruption": r"^\s*ACL Fiber Disruption\s*:\s*(?:Approximately\s*)?([0-9]+)\s*%\s*$",
+        "mcl_sprain_grade": r"^\s*MCL Sprain Grade\s*:\s*(.+?)\s*$",
+        "medial_joint_space": r"^\s*Medial Joint Space\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*mm\s*$",
+        "lateral_joint_space": r"^\s*Lateral Joint Space\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*mm\s*$",
+        "quadriceps_strength": r"^\s*Quadriceps Strength\s*:\s*([0-9]+)\s*/\s*5\s*$",
+        "hamstring_strength": r"^\s*Hamstring Strength\s*:\s*([0-9]+)\s*/\s*5\s*$",
+        "knee_stability_score": r"^\s*Knee Stability Score\s*:\s*([0-9]+)\s*/\s*100\s*$",
+        "functional_mobility_score": r"^\s*Functional Mobility Score\s*:\s*([0-9]+)\s*/\s*100\s*$",
+        "range_of_motion": r"^\s*Range of Motion\s*:\s*([0-9]+°?\s*to\s*[0-9]+°?)\s*$",
+        "swelling_grade": r"^\s*Swelling Grade\s*:\s*(.+?)\s*$",
+        "weight_bearing": r"^\s*Weight Bearing\s*:\s*(.+?)\s*$",
+        "lachman_test": r"^\s*Lachman Test\s*:\s*(.+?)\s*$",
+        "anterior_drawer_test": r"^\s*Anterior Drawer Test\s*:\s*(.+?)\s*$",
+        "mcmurray_test": r"^\s*McMurray Test\s*:\s*(.+?)\s*$",
+        "varus_stress_test": r"^\s*Varus Stress Test\s*:\s*(.+?)\s*$",
+        "valgus_stress_test": r"^\s*Valgus Stress Test\s*:\s*(.+?)\s*$",
+    }
+
+    for key, pattern in patterns.items():
+        match = re.search(pattern, text_value, re.IGNORECASE | re.MULTILINE)
+        if match:
+            value = match.group(1).strip()
+            value = value.replace(",", "")
+            metrics[key] = value
+
+    return metrics
+
+
+def format_metric_name(metric_name: str):
+    return str(metric_name).replace("_", " ").title()
+
+
+def compare_metrics(first_metrics, second_metrics):
+    comparison = []
+
+    all_keys = sorted(set(first_metrics.keys()) | set(second_metrics.keys()))
+
+    for key in all_keys:
+        first_value = first_metrics.get(key)
+        second_value = second_metrics.get(key)
+
+        if first_value is None and second_value is not None:
+            comparison.append({
+                "metric": key,
+                "first_value": None,
+                "second_value": second_value,
+                "difference": None,
+                "status": "new"
+            })
+            continue
+
+        if first_value is not None and second_value is None:
+            comparison.append({
+                "metric": key,
+                "first_value": first_value,
+                "second_value": None,
+                "difference": None,
+                "status": "removed"
+            })
+            continue
+
+        normalized_first = normalize_metric_value(first_value)
+        normalized_second = normalize_metric_value(second_value)
+
+        if isinstance(normalized_first, (int, float)) and isinstance(normalized_second, (int, float)):
+            difference = round(normalized_second - normalized_first, 2)
+
+            if difference > 0:
+                status = "increased"
+            elif difference < 0:
+                status = "decreased"
+            else:
+                status = "unchanged"
+
+            comparison.append({
+                "metric": key,
+                "first_value": first_value,
+                "second_value": second_value,
+                "difference": difference,
+                "status": status
+            })
+        else:
+            if str(first_value).strip().lower() == str(second_value).strip().lower():
+                status = "unchanged"
+            else:
+                status = "changed"
+
+            comparison.append({
+                "metric": key,
+                "first_value": first_value,
+                "second_value": second_value,
+                "difference": None,
+                "status": status
+            })
+
+    return comparison
+
+
+def build_paragraph_summary(first_record, second_record, metric_comparison, new_findings, resolved_findings, common_findings):
+    changed_sentences = []
+    comparison_points = []
+    improved_items = []
+    worsened_items = []
+    stable_items = []
+    new_concerns = []
+
+    improvement_keywords = [
+        "pain_score",
+        "joint_effusion",
+        "acl_fiber_disruption",
+        "heart_rate",
+        "blood_pressure",
+        "fasting_glucose",
+        "postprandial_glucose",
+        "random_glucose",
+        "hba1c",
+        "total_cholesterol",
+        "ldl",
+        "triglycerides",
+        "tsh",
+        "creatinine",
+        "urea",
+        "bun",
+        "uric_acid",
+        "sgpt_alt",
+        "sgot_ast",
+        "bilirubin_total",
+        "esr",
+        "wbc"
+    ]
+
+    higher_is_better = [
+        "range_of_motion",
+        "quadriceps_strength",
+        "hamstring_strength",
+        "knee_stability_score",
+        "functional_mobility_score",
+        "hdl",
+        "hemoglobin",
+        "vitamin_d",
+        "vitamin_b12",
+        "calcium"
+    ]
+
+    for metric in metric_comparison:
+        metric_key = metric["metric"]
+        metric_name = format_metric_name(metric_key)
+        first_value = metric.get("first_value")
+        second_value = metric.get("second_value")
+        status = metric.get("status")
+
+        if status == "unchanged":
+            stable_items.append(f"{metric_name} remained stable at {second_value}.")
+            continue
+
+        if status == "new":
+            sentence = f"{metric_name} is newly present in the second report with value {second_value}."
+            changed_sentences.append(sentence)
+            comparison_points.append(sentence)
+            new_concerns.append(sentence)
+            continue
+
+        if status == "removed":
+            sentence = f"{metric_name} was present in the first report with value {first_value}, but it is not present in the second report."
+            changed_sentences.append(sentence)
+            comparison_points.append(sentence)
+            continue
+
+        if status == "changed":
+            sentence = f"{metric_name} changed from {first_value} to {second_value}."
+            changed_sentences.append(sentence)
+            comparison_points.append(sentence)
+            continue
+
+        if status in ["increased", "decreased"]:
+            sentence = f"{metric_name} {status} from {first_value} to {second_value}."
+            changed_sentences.append(sentence)
+            comparison_points.append(sentence)
+
+            if metric_key in higher_is_better:
+                if status == "increased":
+                    improved_items.append(sentence)
+                else:
+                    worsened_items.append(sentence)
+
+            elif metric_key in improvement_keywords:
+                if status == "decreased":
+                    improved_items.append(sentence)
+                else:
+                    worsened_items.append(sentence)
+
+    if new_findings:
+        changed_sentences.append(
+            "New findings in the second report include: " + "; ".join(new_findings) + "."
+        )
+        new_concerns.extend(new_findings)
+
+    if resolved_findings:
+        changed_sentences.append(
+            "Findings present earlier but not present in the second report include: " + "; ".join(resolved_findings) + "."
+        )
+
+    if common_findings:
+        stable_items.extend([f"{item} remained present in both reports." for item in common_findings])
+
+    if changed_sentences:
+        summary = (
+            f"Compared '{first_record.name}' with '{second_record.name}'. "
+            + " ".join(changed_sentences)
+        )
+    else:
+        summary = (
+            f"Compared '{first_record.name}' with '{second_record.name}'. "
+            "No major measurable changes were detected between the two reports."
+        )
+
+    recommended_next_steps = [
+        "Review the comparison with your clinician.",
+        "Upload newer reports when available.",
+        "Do not make treatment or medication changes based only on this AI comparison."
+    ]
+
+    return {
+        "summary": summary,
+        "comparison_points": comparison_points,
+        "improved_items": improved_items,
+        "worsened_items": worsened_items,
+        "stable_items": stable_items,
+        "new_concerns": new_concerns,
+        "recommended_next_steps": recommended_next_steps
+    }
 
 def build_rule_based_report_comparison(first_record, second_record):
     first_key_findings = safe_json_loads(first_record.key_findings, [])
@@ -1199,27 +1615,65 @@ def build_rule_based_report_comparison(first_record, second_record):
     first_metrics = safe_json_loads(first_record.metrics_data, {})
     second_metrics = safe_json_loads(second_record.metrics_data, {})
 
+    first_text_metrics = extract_medical_report_metrics_from_text(
+        first_record.extracted_text or first_record.analysis_summary or ""
+    )
+
+    second_text_metrics = extract_medical_report_metrics_from_text(
+        second_record.extracted_text or second_record.analysis_summary or ""
+    )
+
+    first_metrics = {**first_metrics, **first_text_metrics}
+    second_metrics = {**second_metrics, **second_text_metrics}
+
     metric_comparison = compare_metrics(first_metrics, second_metrics)
 
-    first_findings_set = set([str(item).strip() for item in first_key_findings if str(item).strip()])
-    second_findings_set = set([str(item).strip() for item in second_key_findings if str(item).strip()])
+    first_findings_set = set([
+        str(item).strip()
+        for item in first_key_findings
+        if str(item).strip()
+    ])
+
+    second_findings_set = set([
+        str(item).strip()
+        for item in second_key_findings
+        if str(item).strip()
+    ])
 
     new_findings = sorted(list(second_findings_set - first_findings_set))
     resolved_findings = sorted(list(first_findings_set - second_findings_set))
     common_findings = sorted(list(first_findings_set & second_findings_set))
 
-    increased_metrics = [m for m in metric_comparison if m["status"] == "increased"]
-    decreased_metrics = [m for m in metric_comparison if m["status"] == "decreased"]
-    new_metrics = [m for m in metric_comparison if m["status"] == "new"]
-    removed_metrics = [m for m in metric_comparison if m["status"] == "removed"]
+    paragraph_result = build_paragraph_summary(
+        first_record,
+        second_record,
+        metric_comparison,
+        new_findings,
+        resolved_findings,
+        common_findings
+    )
+
+    increased_metrics = [
+        item for item in metric_comparison
+        if item["status"] == "increased"
+    ]
+
+    decreased_metrics = [
+        item for item in metric_comparison
+        if item["status"] == "decreased"
+    ]
+
+    changed_metrics = [
+        item for item in metric_comparison
+        if item["status"] in ["increased", "decreased", "changed", "new", "removed"]
+    ]
 
     return {
-        "summary": (
-            f"Compared '{first_record.name}' with '{second_record.name}'. "
-            f"{len(metric_comparison)} metric(s) were checked, "
-            f"{len(new_findings)} new finding(s) appeared, and "
-            f"{len(resolved_findings)} previous finding(s) were no longer present."
-        ),
+        "summary": paragraph_result["summary"],
+        "ai_summary": paragraph_result["summary"],
+        "patient_friendly_explanation": paragraph_result["summary"],
+        "comparison_points": paragraph_result["comparison_points"],
+
         "first_record": {
             "id": first_record.id,
             "name": first_record.name,
@@ -1228,6 +1682,7 @@ def build_rule_based_report_comparison(first_record, second_record):
             "uploaded_at": first_record.uploaded_at.isoformat() if first_record.uploaded_at else None,
             "summary": first_record.analysis_summary
         },
+
         "second_record": {
             "id": second_record.id,
             "name": second_record.name,
@@ -1236,16 +1691,24 @@ def build_rule_based_report_comparison(first_record, second_record):
             "uploaded_at": second_record.uploaded_at.isoformat() if second_record.uploaded_at else None,
             "summary": second_record.analysis_summary
         },
+
         "metric_comparison": metric_comparison,
+        "changed_metrics": changed_metrics,
+        "increased_metrics": increased_metrics,
+        "decreased_metrics": decreased_metrics,
+
         "new_findings": new_findings,
         "resolved_findings": resolved_findings,
         "common_findings": common_findings,
-        "increased_metrics": increased_metrics,
-        "decreased_metrics": decreased_metrics,
-        "new_metrics": new_metrics,
-        "removed_metrics": removed_metrics,
+
+        "improved_items": paragraph_result["improved_items"],
+        "worsened_items": paragraph_result["worsened_items"],
+        "stable_items": paragraph_result["stable_items"],
+        "new_concerns": paragraph_result["new_concerns"],
+        "recommended_next_steps": paragraph_result["recommended_next_steps"],
+
         "ai_recommendation": (
-            "This comparison is generated from extracted report text and AI-detected metrics. "
+            "This comparison is generated from extracted report text and detected metrics. "
             "Please review the changes with a qualified healthcare professional before making medical decisions."
         )
     }
@@ -7817,7 +8280,17 @@ Text:
 
             ai_result = json.loads(response_text)
 
-            comparison["ai_summary"] = ai_result.get("summary")
+            gemini_summary = ai_result.get("summary") if isinstance(ai_result, dict) else None
+
+            if gemini_summary and len(str(gemini_summary).strip()) > 20:
+                comparison["ai_summary"] = comparison["summary"]
+                comparison["patient_friendly_explanation"] = comparison["summary"]
+            else:
+                comparison["ai_summary"] = comparison["summary"]
+                comparison["patient_friendly_explanation"] = comparison["summary"]
+
+            if comparison["summary"] and "Key changes:" in comparison["summary"]:
+                comparison["ai_summary"] = comparison["summary"]
             comparison["improved_items"] = ai_result.get("improved_items", [])
             comparison["worsened_items"] = ai_result.get("worsened_items", [])
             comparison["new_concerns"] = ai_result.get("new_concerns", [])
@@ -7851,7 +8324,17 @@ Text:
             "Do not make treatment changes based only on this comparison."
         ]
 
+    print("FIRST RECORD:", first_record.name)
+    print("FIRST METRICS:", first_record.metrics_data)
+
+    print("SECOND RECORD:", second_record.name)
+    print("SECOND METRICS:", second_record.metrics_data)
+
+    print("METRIC COMPARISON:", comparison.get("metric_comparison"))
+
     return comparison
+
+
 
 # ================== AI HEALTH TIPS ==================
 
