@@ -46,12 +46,33 @@ body {
 }
 
 @media (max-width: 768px) {
-  .dashboard-responsive .max-w-7xl {
+  .app-responsive .max-w-7xl,
+  .app-responsive .max-w-5xl,
+  .app-responsive .max-w-4xl,
+  .app-responsive .max-w-3xl,
+  .app-responsive .max-w-2xl,
+  .app-responsive .max-w-xl,
+  .app-responsive .max-w-lg,
+  .app-responsive .max-w-md,
+  .dashboard-responsive .max-w-7xl,
+  .dashboard-responsive .max-w-5xl,
+  .dashboard-responsive .max-w-4xl,
+  .dashboard-responsive .max-w-3xl,
+  .dashboard-responsive .max-w-2xl,
+  .dashboard-responsive .max-w-xl,
+  .dashboard-responsive .max-w-lg,
+  .dashboard-responsive .max-w-md {
     max-width: 100% !important;
+    width: 100% !important;
     padding-left: 1rem !important;
     padding-right: 1rem !important;
   }
 
+  .app-responsive .grid-cols-2,
+  .app-responsive .grid-cols-3,
+  .app-responsive .grid-cols-4,
+  .app-responsive .grid-cols-5,
+  .app-responsive .grid-cols-6,
   .dashboard-responsive .grid-cols-2,
   .dashboard-responsive .grid-cols-3,
   .dashboard-responsive .grid-cols-4,
@@ -60,7 +81,67 @@ body {
     grid-template-columns: repeat(1, minmax(0, 1fr)) !important;
   }
 
+  .app-responsive .flex,
   .dashboard-responsive .flex {
     flex-wrap: wrap;
+    gap: 1rem;
+  }
+
+  .app-responsive button,
+  .app-responsive input,
+  .app-responsive select,
+  .app-responsive textarea,
+  .dashboard-responsive button,
+  .dashboard-responsive input,
+  .dashboard-responsive select,
+  .dashboard-responsive textarea {
+    min-width: 0;
+  }
+
+  .app-responsive .w-10,
+  .app-responsive .h-10,
+  .app-responsive .w-12,
+  .app-responsive .h-12,
+  .app-responsive .w-8,
+  .app-responsive .h-8,
+  .dashboard-responsive .w-10,
+  .dashboard-responsive .h-10,
+  .dashboard-responsive .w-12,
+  .dashboard-responsive .h-12,
+  .dashboard-responsive .w-8,
+  .dashboard-responsive .h-8 {
+    width: auto !important;
+    height: auto !important;
+  }
+
+  .app-responsive .overflow-x-auto,
+  .dashboard-responsive .overflow-x-auto {
+    overflow-x: auto;
+  }
+}
+
+@media (max-width: 480px) {
+  .app-responsive .p-6,
+  .app-responsive .p-5,
+  .app-responsive .px-6,
+  .app-responsive .px-5,
+  .app-responsive .py-6,
+  .app-responsive .py-5,
+  .dashboard-responsive .p-6,
+  .dashboard-responsive .p-5,
+  .dashboard-responsive .px-6,
+  .dashboard-responsive .px-5,
+  .dashboard-responsive .py-6,
+  .dashboard-responsive .py-5 {
+    padding: 1rem !important;
+  }
+
+  .app-responsive .text-xl,
+  .app-responsive .text-2xl,
+  .app-responsive .text-3xl,
+  .dashboard-responsive .text-xl,
+  .dashboard-responsive .text-2xl,
+  .dashboard-responsive .text-3xl {
+    font-size: 1rem !important;
   }
 }

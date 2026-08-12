@@ -10,9 +10,11 @@ const root = ReactDOM.createRoot(document.getElementById("root"));
 root.render(
   <React.StrictMode>
     <GoogleOAuthProvider clientId={import.meta.env.VITE_GOOGLE_CLIENT_ID}>
-      <AuthProvider>
-        <App />
-      </AuthProvider>
+      <div className="app-responsive">
+        <AuthProvider>
+          <App />
+        </AuthProvider>
+      </div>
     </GoogleOAuthProvider>
   </React.StrictMode>
 );
