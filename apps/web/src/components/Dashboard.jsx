@@ -30,6 +30,7 @@ import ClinicalExportButton from "./ClinicalExportButton";
 import ChatProductivityToolbar from "./ChatProductivityToolbar";
 import CareConnections from "./CareConnections";
 import ClinicianAvailabilityEditor from "./ClinicianAvailabilityEditor";
+import DoctorCrossConsultSearch from "./DoctorCrossConsultSearch";
 
 const MealPlanner = lazy(() => import("../meal-planner/MealPlanner"));
 
@@ -1216,14 +1217,29 @@ const Dashboard = () => {
     const escapeCsv = (value) =>
       `"${String(value ?? "").replaceAll('"', '""')}"`;
     const rows = [
-      ["Sent at", "Sender", "Recipient", "Message", "Attachment", "Prescription"],
+      [
+        "Sent at",
+        "Sender",
+        "Recipient",
+        "Message",
+        "Attachment",
+        "Prescription",
+      ],
       ...conversationMessages.map((message) => [
         message.sent_at,
-        message.sender_email || (message.is_mine ? user?.email : selectedConversation.other_user_email),
-        message.recipient_email || (message.is_mine ? selectedConversation.other_user_email : user?.email),
+        message.sender_email ||
+          (message.is_mine
+            ? user?.email
+            : selectedConversation.other_user_email),
+        message.recipient_email ||
+          (message.is_mine
+            ? selectedConversation.other_user_email
+            : user?.email),
         message.message || "",
         message.attachment?.file_name || "",
-        message.prescription?.id ? `Prescription #${message.prescription.id}` : "",
+        message.prescription?.id
+          ? `Prescription #${message.prescription.id}`
+          : "",
       ]),
     ];
     const csv = rows.map((row) => row.map(escapeCsv).join(",")).join("\r\n");
@@ -1438,9 +1454,7 @@ const Dashboard = () => {
           </div>
 
           <div className="flex items-center gap-3 relative">
-            {user?.role === "patient" && (
-                <EmergencyAlertButton />
-            )}
+            {user?.role === "patient" && <EmergencyAlertButton />}
             <Notifications />
             <div className="relative">
               <button
@@ -2092,7 +2106,9 @@ const Dashboard = () => {
               <div className="bg-gradient-to-r from-blue-600 to-indigo-600 p-6 text-white">
                 <div className="flex items-start justify-between gap-4">
                   <div>
-                    <h2 className="text-2xl font-bold">Organize medical record</h2>
+                    <h2 className="text-2xl font-bold">
+                      Organize medical record
+                    </h2>
                     <p className="mt-1 text-sm text-blue-100">
                       Confirm the category and source details before upload.
                     </p>
@@ -2236,7 +2252,9 @@ const Dashboard = () => {
                   </button>
                   <button
                     type="submit"
-                    disabled={isUploading || !recordUploadMetadata.recordType.trim()}
+                    disabled={
+                      isUploading || !recordUploadMetadata.recordType.trim()
+                    }
                     className="rounded-lg bg-blue-600 px-5 py-2.5 font-semibold text-white hover:bg-blue-700 disabled:opacity-50"
                   >
                     {isUploading ? "Uploading..." : "Upload securely"}
@@ -3353,74 +3371,118 @@ const Dashboard = () => {
                         <>
                           <div
                             className={`mb-4 h-1.5 rounded-full bg-gradient-to-r ${
-                              (healthStatusPresentations[healthSummary.overall_status] ||
-                                healthStatusPresentations.Unknown).accent
+                              (
+                                healthStatusPresentations[
+                                  healthSummary.overall_status
+                                ] || healthStatusPresentations.Unknown
+                              ).accent
                             }`}
                           />
                           <div className="flex flex-col gap-4 rounded-xl border border-slate-200 bg-gradient-to-br from-slate-50 to-white p-4 sm:flex-row sm:items-center sm:justify-between">
                             <div className="flex items-center gap-4">
                               <div
                                 className={`flex h-12 w-12 shrink-0 items-center justify-center rounded-xl text-xl ${
-                                  (healthStatusPresentations[healthSummary.overall_status] ||
-                                    healthStatusPresentations.Unknown).iconBox
+                                  (
+                                    healthStatusPresentations[
+                                      healthSummary.overall_status
+                                    ] || healthStatusPresentations.Unknown
+                                  ).iconBox
                                 }`}
                               >
                                 <i
                                   className={`fas ${
-                                    (healthStatusPresentations[healthSummary.overall_status] ||
-                                      healthStatusPresentations.Unknown).icon
+                                    (
+                                      healthStatusPresentations[
+                                        healthSummary.overall_status
+                                      ] || healthStatusPresentations.Unknown
+                                    ).icon
                                   }`}
                                 ></i>
                               </div>
                               <div>
-                                <p className="mb-1 text-xs font-semibold uppercase tracking-wider text-slate-500">Overall status</p>
+                                <p className="mb-1 text-xs font-semibold uppercase tracking-wider text-slate-500">
+                                  Overall status
+                                </p>
                                 <div className="flex flex-wrap items-center gap-2">
                                   <span
                                     className={`rounded-full px-3 py-1 text-sm font-bold ring-1 ring-inset ${
-                                      (healthStatusPresentations[healthSummary.overall_status] ||
-                                        healthStatusPresentations.Unknown).badge
+                                      (
+                                        healthStatusPresentations[
+                                          healthSummary.overall_status
+                                        ] || healthStatusPresentations.Unknown
+                                      ).badge
                                     }`}
                                   >
                                     {healthSummary.overall_status || "Unknown"}
                                   </span>
                                   <span className="text-sm text-slate-600">
-                                    {(healthStatusPresentations[healthSummary.overall_status] ||
-                                      healthStatusPresentations.Unknown).message}
+                                    {
+                                      (
+                                        healthStatusPresentations[
+                                          healthSummary.overall_status
+                                        ] || healthStatusPresentations.Unknown
+                                      ).message
+                                    }
                                   </span>
                                 </div>
                               </div>
                             </div>
                             <div className="shrink-0 rounded-xl bg-white px-5 py-2.5 text-center shadow-sm ring-1 ring-slate-200">
-                              <p className="text-2xl font-bold text-slate-900">{healthSummary.total_records ?? records.length}</p>
-                              <p className="text-xs text-slate-500">records analyzed</p>
+                              <p className="text-2xl font-bold text-slate-900">
+                                {healthSummary.total_records ?? records.length}
+                              </p>
+                              <p className="text-xs text-slate-500">
+                                records analyzed
+                              </p>
                             </div>
                           </div>
 
-                          {Object.keys(healthSummary.vital_trends || {}).length > 0 && (
+                          {Object.keys(healthSummary.vital_trends || {})
+                            .length > 0 && (
                             <section className="mt-5">
                               <div className="mb-3 flex items-center justify-between">
-                                <h4 className="text-sm font-bold text-slate-800">Latest health signals</h4>
-                                <span className="text-xs text-slate-400">Recent averages</span>
+                                <h4 className="text-sm font-bold text-slate-800">
+                                  Latest health signals
+                                </h4>
+                                <span className="text-xs text-slate-400">
+                                  Recent averages
+                                </span>
                               </div>
                               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-3">
-                                {Object.entries(healthSummary.vital_trends).map(([key, value]) => {
-                                  const vital = healthVitalPresentations[key] || {
-                                    label: key.replaceAll("_", " "),
-                                    icon: "fa-chart-simple",
-                                    iconClasses: "bg-violet-50 text-violet-600",
-                                  };
-                                  return (
-                                    <div key={key} className="flex items-center gap-3 rounded-xl border border-slate-200 bg-white p-3 transition hover:-translate-y-0.5 hover:shadow-md">
-                                      <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg ${vital.iconClasses}`}>
-                                        <i className={`fas ${vital.icon}`}></i>
+                                {Object.entries(healthSummary.vital_trends).map(
+                                  ([key, value]) => {
+                                    const vital = healthVitalPresentations[
+                                      key
+                                    ] || {
+                                      label: key.replaceAll("_", " "),
+                                      icon: "fa-chart-simple",
+                                      iconClasses:
+                                        "bg-violet-50 text-violet-600",
+                                    };
+                                    return (
+                                      <div
+                                        key={key}
+                                        className="flex items-center gap-3 rounded-xl border border-slate-200 bg-white p-3 transition hover:-translate-y-0.5 hover:shadow-md"
+                                      >
+                                        <div
+                                          className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-lg ${vital.iconClasses}`}
+                                        >
+                                          <i
+                                            className={`fas ${vital.icon}`}
+                                          ></i>
+                                        </div>
+                                        <div className="min-w-0">
+                                          <p className="text-xs font-medium capitalize text-slate-500">
+                                            {vital.label}
+                                          </p>
+                                          <p className="truncate font-bold text-slate-900">
+                                            {value}
+                                          </p>
+                                        </div>
                                       </div>
-                                      <div className="min-w-0">
-                                        <p className="text-xs font-medium capitalize text-slate-500">{vital.label}</p>
-                                        <p className="truncate font-bold text-slate-900">{value}</p>
-                                      </div>
-                                    </div>
-                                  );
-                                })}
+                                    );
+                                  },
+                                )}
                               </div>
                             </section>
                           )}
@@ -3428,39 +3490,65 @@ const Dashboard = () => {
                           <div className="mt-5 grid grid-cols-1 gap-4 md:grid-cols-2">
                             <section className="rounded-xl border border-slate-200 bg-white p-4">
                               <div className="mb-3 flex items-center gap-2">
-                                <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-indigo-50 text-indigo-600"><i className="fas fa-clipboard-check text-sm"></i></div>
-                                <h4 className="font-bold text-slate-900">Key findings</h4>
+                                <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-indigo-50 text-indigo-600">
+                                  <i className="fas fa-clipboard-check text-sm"></i>
+                                </div>
+                                <h4 className="font-bold text-slate-900">
+                                  Key findings
+                                </h4>
                               </div>
                               <ul className="space-y-2.5">
-                                {(healthSummary.recent_findings || []).slice(0, 4).map((finding, index) => (
-                                  <li key={index} className="flex gap-2.5 text-sm leading-5 text-slate-600">
-                                    <span className="mt-2 h-1.5 w-1.5 shrink-0 rounded-full bg-indigo-500"></span>
-                                    <span>{finding}</span>
+                                {(healthSummary.recent_findings || [])
+                                  .slice(0, 4)
+                                  .map((finding, index) => (
+                                    <li
+                                      key={index}
+                                      className="flex gap-2.5 text-sm leading-5 text-slate-600"
+                                    >
+                                      <span className="mt-2 h-1.5 w-1.5 shrink-0 rounded-full bg-indigo-500"></span>
+                                      <span>{finding}</span>
+                                    </li>
+                                  ))}
+                                {!healthSummary.recent_findings?.length && (
+                                  <li className="text-sm text-slate-500">
+                                    No structured findings were detected.
                                   </li>
-                                ))}
-                                {!healthSummary.recent_findings?.length && <li className="text-sm text-slate-500">No structured findings were detected.</li>}
+                                )}
                               </ul>
                             </section>
 
                             <section className="rounded-xl border border-blue-100 bg-blue-50/70 p-4">
                               <div className="mb-3 flex items-center gap-2">
-                                <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-blue-100 text-blue-700"><i className="fas fa-stethoscope text-sm"></i></div>
-                                <h4 className="font-bold text-slate-900">Recommended next steps</h4>
+                                <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-blue-100 text-blue-700">
+                                  <i className="fas fa-stethoscope text-sm"></i>
+                                </div>
+                                <h4 className="font-bold text-slate-900">
+                                  Recommended next steps
+                                </h4>
                               </div>
                               <ul className="space-y-2.5">
-                                {(healthSummary.recommendations || []).slice(0, 4).map((recommendation, index) => (
-                                  <li key={index} className="flex gap-2.5 text-sm leading-5 text-slate-700">
-                                    <i className="fas fa-check mt-1 text-xs text-blue-600"></i>
-                                    <span>{recommendation}</span>
-                                  </li>
-                                ))}
+                                {(healthSummary.recommendations || [])
+                                  .slice(0, 4)
+                                  .map((recommendation, index) => (
+                                    <li
+                                      key={index}
+                                      className="flex gap-2.5 text-sm leading-5 text-slate-700"
+                                    >
+                                      <i className="fas fa-check mt-1 text-xs text-blue-600"></i>
+                                      <span>{recommendation}</span>
+                                    </li>
+                                  ))}
                               </ul>
                             </section>
                           </div>
 
                           <div className="mt-4 flex items-start gap-2 rounded-lg bg-slate-50 px-3 py-2.5 text-xs leading-5 text-slate-500">
                             <i className="fas fa-shield-heart mt-1 text-slate-400"></i>
-                            <span>This AI-generated overview is informational and does not replace advice from a qualified healthcare professional.</span>
+                            <span>
+                              This AI-generated overview is informational and
+                              does not replace advice from a qualified
+                              healthcare professional.
+                            </span>
                           </div>
                         </>
                       )}
@@ -5148,7 +5236,8 @@ const Dashboard = () => {
                   Security & Access Audit
                 </h3>
                 <p className="mb-4 text-sm text-gray-500">
-                  Sensitive reads, changes, denied requests, and session activity.
+                  Sensitive reads, changes, denied requests, and session
+                  activity.
                 </p>
                 <div className="space-y-2 max-h-[32rem] overflow-y-auto">
                   {securityAuditEvents.map((event) => (
@@ -5175,8 +5264,8 @@ const Dashboard = () => {
                             </span>
                           </div>
                           <p className="mt-1 text-xs text-gray-500">
-                            Actor: {event.actor_email || "Unauthenticated"} · Role:{" "}
-                            {event.actor_role || "none"} · IP:{" "}
+                            Actor: {event.actor_email || "Unauthenticated"} ·
+                            Role: {event.actor_role || "none"} · IP:{" "}
                             {event.ip_address || "unknown"}
                           </p>
                           <p className="mt-1 text-xs text-gray-400">
@@ -5952,14 +6041,20 @@ const Dashboard = () => {
 
         {currentView === "clinical-search" &&
           ["admin", "clinician"].includes(user?.role) && (
-          <ClinicalSearch
-            user={user}
-            onOpenPatient={(patient) => {
-              setClinicalProfileTarget(patient);
-            }}
-            onOpenRecord={(recordId) => loadRecordDetails(recordId)}
-          />
-        )}
+            <div className="space-y-8">
+              <ClinicalSearch
+                user={user}
+                onOpenPatient={(patient) => {
+                  setClinicalProfileTarget(patient);
+                }}
+                onOpenRecord={(recordId) => loadRecordDetails(recordId)}
+              />
+
+              {/* {user?.role === "clinician" && (
+                <DoctorCrossConsultSearch user={user} />
+              )} */}
+            </div>
+          )}
 
         {currentView === "security" && <SecuritySessions />}
 

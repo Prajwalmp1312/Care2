@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from "react";
 import axios from "axios";
-
+import DoctorCrossConsultSearch from "./DoctorCrossConsultSearch";
 const resourceStyles = {
   record: { icon: "fa-file-medical", badge: "bg-blue-100 text-blue-700" },
   prescription: {
@@ -372,6 +372,9 @@ const ClinicalSearch = ({
           </button>
         </div>
       </form>
+      {user?.role === "clinician" && (
+                <DoctorCrossConsultSearch user={user} />
+              )}
 
       {error && (
         <div className="rounded-lg border border-red-200 bg-red-50 p-4 text-red-700">

@@ -287,6 +287,25 @@ class ChatAttachment(Base):
     file_size = Column(Integer)  # in bytes
     uploaded_at = Column(DateTime, default=utc_now)
 
+class CrossConsultation(Base):
+    __tablename__ = "cross_consultations"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    patient_email = Column(String(100), ForeignKey("patients.email"), nullable=False)
+    requested_by_clinician_email = Column(String(100), ForeignKey("clinicians.email"), nullable=False)
+    requested_to_clinician_email = Column(String(100), ForeignKey("clinicians.email"), nullable=False)
+
+    reason = Column(Text, nullable=False)
+    case_summary = Column(Text, nullable=True)
+    priority = Column(String(30), default="normal")
+    status = Column(String(30), default="pending")
+
+    response_notes = Column(Text, nullable=True)
+    recommendation = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, default=utc_now)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
 class ClinicianJoinRequest(Base):
     __tablename__ = "clinician_join_requests"

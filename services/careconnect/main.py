@@ -33,7 +33,7 @@ from models import MessageRequest as MessageRequestModel
 from database import SessionLocal
 from database import get_db, init_db, get_user_by_email_and_role, email_exists
 from models import Patient as PatientModel, Clinician as ClinicianModel, Admin as AdminModel, Appointment as AppointmentModel, AppointmentReminder as AppointmentReminderModel, Prescription as PrescriptionModel, Notification as NotificationModel, MedicalRecordVersion as RecordVersionModel, PatientProfileHistory as PatientProfileHistoryModel, EmergencyAlert as EmergencyAlertModel, EmergencyAlertEvent as EmergencyAlertEventModel, UserConsent as UserConsentModel, VideoConsultationEvent as VideoConsultationEventModel, UserSession as UserSessionModel, SecurityAuditEvent as SecurityAuditEventModel
-from models import Message as MessageModel, MedicalRecord as RecordModel
+from models import Message as MessageModel, MedicalRecord as RecordModel, CrossConsultation as CrossConsultationModel
 import mimetypes
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -581,6 +581,20 @@ class EmergencyAlertEscalationRequest(BaseModel):
 class EmergencyFalseAlarmRequest(BaseModel):
     confirmed: bool
 
+class CrossConsultationCreate(BaseModel):
+    patient_email: EmailStr
+    requested_to_clinician_email: EmailStr
+    reason: str
+    case_summary: Optional[str] = None
+    priority: str = "normal"    
+
+class CrossConsultationUpdate(BaseModel):
+    status: str
+    response_notes: Optional[str] = None
+    recommendation: Optional[str] = None
+
+
+
 # Helper Functions
 def utc_now_aware() -> datetime:
     """Return a timezone-aware UTC timestamp for tokens and API metadata."""
@@ -948,6 +962,146 @@ async def revoke_consent(
     db.commit()
     return {"message": "Consent revoked", "consent_type": consent_type}
 
+@app.get("/api/cross-consultations")
+async def get_cross_consultations(
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    try:
+        if current_user.role == "patient":
+            consultations = db.query(CrossConsultationModel).filter(
+                CrossConsultationModel.patient_email == current_user.email
+            ).order_by(CrossConsultationModel.created_at.desc()).all()
+
+        elif current_user.role == "clinician":
+            consultations = db.query(CrossConsultationModel).filter(
+                or_(
+                    CrossConsultationModel.requested_by_clinician_email == current_user.email,
+                    CrossConsultationModel.requested_to_clinician_email == current_user.email
+                )
+            ).order_by(CrossConsultationModel.created_at.desc()).all()
+
+        elif current_user.role == "admin":
+            consultations = db.query(CrossConsultationModel).order_by(
+                CrossConsultationModel.created_at.desc()
+            ).all()
+
+        else:
+            raise HTTPException(status_code=403, detail="Not authorized")
+
+        results = []
+
+        for item in consultations:
+            patient = db.query(PatientModel).filter(
+                PatientModel.email == item.patient_email
+            ).first()
+
+            requested_by = db.query(ClinicianModel).filter(
+                ClinicianModel.email == item.requested_by_clinician_email
+            ).first()
+
+            requested_to = db.query(ClinicianModel).filter(
+                ClinicianModel.email == item.requested_to_clinician_email
+            ).first()
+
+            direction = "received" if item.requested_to_clinician_email == current_user.email else "sent"
+
+            results.append({
+                "id": item.id,
+                "direction": direction,
+
+                "patient_email": item.patient_email,
+                "patient_name": patient.name if patient else item.patient_email,
+
+                "requested_by_clinician_email": item.requested_by_clinician_email,
+                "requested_by_clinician_name": requested_by.name if requested_by else item.requested_by_clinician_email,
+
+                "requested_to_clinician_email": item.requested_to_clinician_email,
+                "requested_to_clinician_name": requested_to.name if requested_to else item.requested_to_clinician_email,
+                "requested_to_specialization": requested_to.specialization if requested_to else None,
+
+                "reason": item.reason,
+                "case_summary": item.case_summary,
+                "priority": item.priority,
+                "status": item.status,
+
+                "response_notes": item.response_notes,
+                "recommendation": item.recommendation,
+
+                "created_at": item.created_at.isoformat() if item.created_at else None,
+                "updated_at": item.updated_at.isoformat() if item.updated_at else None
+            })
+
+        return {
+            "referrals": results,
+            "sent": [item for item in results if item["direction"] == "sent"],
+            "received": [item for item in results if item["direction"] == "received"],
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        print("Cross consultation load error:", str(e))
+        raise HTTPException(
+            status_code=500,
+            detail=f"Cross consultation load failed: {str(e)}"
+        )
+
+@app.put("/api/cross-consultations/{consultation_id}")
+async def update_cross_consultation(
+    consultation_id: int,
+    data: CrossConsultationUpdate,
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    try:
+        if current_user.role != "clinician":
+            raise HTTPException(
+                status_code=403,
+                detail="Only clinicians can update cross consultation requests"
+            )
+
+        consultation = db.query(CrossConsultationModel).filter(
+            CrossConsultationModel.id == consultation_id
+        ).first()
+
+        if not consultation:
+            raise HTTPException(status_code=404, detail="Cross consultation request not found")
+
+        if consultation.requested_to_clinician_email != current_user.email:
+            raise HTTPException(
+                status_code=403,
+                detail="Only the receiving doctor can update this request"
+            )
+
+        allowed_statuses = ["accepted", "rejected", "completed"]
+
+        if data.status not in allowed_statuses:
+            raise HTTPException(status_code=400, detail="Invalid status")
+
+        consultation.status = data.status
+        consultation.response_notes = data.response_notes
+        consultation.recommendation = data.recommendation
+
+        db.commit()
+        db.refresh(consultation)
+
+        return {
+            "message": f"Cross consultation {data.status} successfully"
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        print("Cross consultation update error:", str(e))
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Cross consultation update failed: {str(e)}"
+        )
+
 def get_connected_clinician_emails_for_patient(db: Session, patient_email: str):
     connections = db.query(MessageRequestModel).filter(
         MessageRequestModel.patient_email == patient_email,
@@ -962,6 +1116,174 @@ def get_connected_clinician_emails_for_patient(db: Session, patient_email: str):
 
     return clinician_emails
 
+@app.get("/api/referral/clinicians")
+async def search_referral_clinicians(
+    search: Optional[str] = "",
+    specialization: Optional[str] = "",
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if current_user.role != "clinician":
+        raise HTTPException(status_code=403, detail="Only clinicians can search referral doctors")
+
+    query = db.query(ClinicianModel).filter(
+        ClinicianModel.is_active == True,
+        ClinicianModel.approval_status == "approved",
+        ClinicianModel.email != current_user.email
+    )
+
+    if search:
+        query = query.filter(
+            or_(
+                ClinicianModel.name.ilike(f"%{search}%"),
+                ClinicianModel.email.ilike(f"%{search}%"),
+                ClinicianModel.specialization.ilike(f"%{search}%"),
+                ClinicianModel.department.ilike(f"%{search}%")
+            )
+        )
+
+    if specialization and specialization != "all":
+        query = query.filter(
+            ClinicianModel.specialization.ilike(f"%{specialization}%")
+        )
+
+    doctors = query.order_by(ClinicianModel.name.asc()).all()
+
+    return {
+        "clinicians": [
+            {
+                "id": doctor.id,
+                "name": doctor.name,
+                "email": doctor.email,
+                "specialization": doctor.specialization or "General care",
+                "department": doctor.department or "Clinical Services",
+                "years_of_experience": doctor.years_of_experience or 0,
+                "phone": doctor.phone,
+            }
+            for doctor in doctors
+        ]
+    }
+
+
+@app.get("/api/referral/specializations")
+async def get_referral_specializations(
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if current_user.role != "clinician":
+        raise HTTPException(status_code=403, detail="Only clinicians can access specializations")
+
+    rows = db.query(ClinicianModel.specialization).filter(
+        ClinicianModel.is_active == True,
+        ClinicianModel.approval_status == "approved",
+        ClinicianModel.specialization.isnot(None)
+    ).distinct().all()
+
+    return {
+        "specializations": sorted([
+            row[0] for row in rows
+            if row[0] and str(row[0]).strip()
+        ])
+    }
+
+
+@app.get("/api/referral/my-patients")
+async def get_referral_my_patients(
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if current_user.role != "clinician":
+        raise HTTPException(status_code=403, detail="Only clinicians can access patients")
+
+    appointment_emails = [
+        row[0]
+        for row in db.query(AppointmentModel.patient_email).filter(
+            AppointmentModel.clinician_email == current_user.email
+        ).all()
+    ]
+
+    accepted_request_emails = [
+        row[0]
+        for row in db.query(MessageRequestModel.patient_email).filter(
+            MessageRequestModel.clinician_email == current_user.email,
+            MessageRequestModel.status == "accepted"
+        ).all()
+    ]
+
+    patient_emails = list(set(appointment_emails + accepted_request_emails))
+
+    if not patient_emails:
+        return {"patients": []}
+
+    patients = db.query(PatientModel).filter(
+        PatientModel.email.in_(patient_emails)
+    ).order_by(PatientModel.name.asc()).all()
+
+    return {
+        "patients": [
+            {
+                "id": patient.id,
+                "name": patient.name,
+                "email": patient.email,
+                "age": patient.age,
+                "blood_type": patient.blood_type,
+                "status": patient.status,
+            }
+            for patient in patients
+        ]
+    }
+
+@app.post("/api/cross-consultations")
+async def create_cross_consultation(
+    data: CrossConsultationCreate,
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if current_user.role != "clinician":
+        raise HTTPException(
+            status_code=403,
+            detail="Only clinicians can create cross consultation referrals"
+        )
+
+    patient = db.query(PatientModel).filter(
+        PatientModel.email == data.patient_email
+    ).first()
+
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
+    target_clinician = db.query(ClinicianModel).filter(
+        ClinicianModel.email == data.requested_to_clinician_email,
+        ClinicianModel.is_active == True
+    ).first()
+
+    if not target_clinician:
+        raise HTTPException(status_code=404, detail="Referral doctor not found")
+
+    if target_clinician.email == current_user.email:
+        raise HTTPException(
+            status_code=400,
+            detail="You cannot refer a patient to yourself"
+        )
+
+    consultation = CrossConsultationModel(
+        patient_email=data.patient_email,
+        requested_by_clinician_email=current_user.email,
+        requested_to_clinician_email=data.requested_to_clinician_email,
+        reason=data.reason,
+        case_summary=data.case_summary,
+        priority=data.priority,
+        status="pending"
+    )
+
+    db.add(consultation)
+    db.commit()
+    db.refresh(consultation)
+
+    return {
+        "message": "Cross consultation referral sent successfully",
+        "consultation_id": consultation.id
+    }
 
 def notify_emergency_alert_receivers(db: Session, alert: EmergencyAlertModel):
     # Confirm the SOS in the patient's dashboard notification stream. Patients
