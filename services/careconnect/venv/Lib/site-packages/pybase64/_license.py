@@ -2,7 +2,7 @@ _license = """pybase64
 ===============================================================================
 BSD 2-Clause License
 
-Copyright (c) 2017-2022, Matthieu Darbois
+Copyright (c) 2017-2026, Matthieu Darbois
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without

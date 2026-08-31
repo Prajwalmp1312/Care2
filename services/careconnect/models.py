@@ -298,14 +298,22 @@ class CrossConsultation(Base):
 
     reason = Column(Text, nullable=False)
     case_summary = Column(Text, nullable=True)
+
+    # NEW: selected medical record ids attached to consult
+    attached_record_ids = Column(Text, nullable=True)
+
     priority = Column(String(30), default="normal")
     status = Column(String(30), default="pending")
 
     response_notes = Column(Text, nullable=True)
     recommendation = Column(Text, nullable=True)
 
+    # NEW: specialist final notes
+    specialist_notes = Column(Text, nullable=True)
+
     created_at = Column(DateTime, default=utc_now)
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
+    completed_at = Column(DateTime, nullable=True)
 
 class ClinicianJoinRequest(Base):
     __tablename__ = "clinician_join_requests"
@@ -457,6 +465,22 @@ class UserSession(Base):
     last_seen_at = Column(DateTime, default=utc_now, nullable=False)
     revoked_at = Column(DateTime, nullable=True, index=True)
     revoke_reason = Column(String(255), nullable=True)
+
+
+class AccountDeletionRequest(Base):
+    """Auditable privacy request separated from legally retained care records."""
+
+    __tablename__ = "account_deletion_requests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_email = Column(String(100), nullable=False, index=True)
+    user_role = Column(String(20), nullable=False, index=True)
+    status = Column(String(30), nullable=False, default="pending", index=True)
+    requested_at = Column(DateTime, default=utc_now, nullable=False, index=True)
+    scheduled_for = Column(DateTime, nullable=False, index=True)
+    completed_at = Column(DateTime, nullable=True)
+    retention_notice = Column(Text, nullable=False)
+    request_ip = Column(String(64), nullable=True)
 
 
 class SecurityAuditEvent(Base):

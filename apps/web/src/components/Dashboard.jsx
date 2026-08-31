@@ -31,11 +31,74 @@ import ChatProductivityToolbar from "./ChatProductivityToolbar";
 import CareConnections from "./CareConnections";
 import ClinicianAvailabilityEditor from "./ClinicianAvailabilityEditor";
 import DoctorCrossConsultSearch from "./DoctorCrossConsultSearch";
+import PatientCrossConsultationStatus from "./PatientCrossConsultationStatus";
 
 const MealPlanner = lazy(() => import("../meal-planner/MealPlanner"));
 
 const getDashboardStorageKey = (role, key) =>
   `careconnect:${role || "guest"}:${key}`;
+
+const defaultMealPlanningProfile = {
+  purpose: "Improve Health",
+  allergies: [],
+  intolerances: [],
+  disliked_ingredients: [],
+  dietary_preferences: [],
+  default_cuisine: "Any",
+  available_time_minutes: 30,
+  budget_level: "moderate",
+  servings: 1,
+  activity_level: "moderate",
+};
+
+const listToText = (value) => (Array.isArray(value) ? value.join(", ") : "");
+const textToList = (value) =>
+  String(value || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(
+      (item, index, values) =>
+        item &&
+        values.findIndex(
+          (candidate) => candidate.toLowerCase() === item.toLowerCase(),
+        ) === index,
+    );
+
+const profileForEditing = (profile = {}) => {
+  const mealPlanning = {
+    ...defaultMealPlanningProfile,
+    ...(profile.meal_planning || {}),
+  };
+  return {
+    ...profile,
+    countryCode: profile.countryCode || "+91",
+    emergencyCountryCode: profile.emergencyCountryCode || "+91",
+    phone: profile.phone || "",
+    emergencyPhone: profile.emergencyPhone || "",
+    meal_planning: {
+      ...mealPlanning,
+      allergies_text: listToText(mealPlanning.allergies),
+      intolerances_text: listToText(mealPlanning.intolerances),
+      disliked_ingredients_text: listToText(mealPlanning.disliked_ingredients),
+    },
+  };
+};
+
+const profileForSaving = (profile) => {
+  const mealPlanning = {
+    ...defaultMealPlanningProfile,
+    ...(profile.meal_planning || {}),
+  };
+  mealPlanning.allergies = textToList(mealPlanning.allergies_text);
+  mealPlanning.intolerances = textToList(mealPlanning.intolerances_text);
+  mealPlanning.disliked_ingredients = textToList(
+    mealPlanning.disliked_ingredients_text,
+  );
+  delete mealPlanning.allergies_text;
+  delete mealPlanning.intolerances_text;
+  delete mealPlanning.disliked_ingredients_text;
+  return { ...profile, meal_planning: mealPlanning };
+};
 
 const healthStatusPresentations = {
   Critical: {
@@ -153,6 +216,7 @@ const Dashboard = () => {
     age: "",
     bloodType: "",
     address: "",
+    meal_planning: { ...defaultMealPlanningProfile },
   });
 
   const [adminStats, setAdminStats] = useState({});
@@ -460,19 +524,9 @@ const Dashboard = () => {
       const res = await axios.get("/api/profile", {
         headers: { Authorization: `Bearer ${token}` },
       });
-      const profileWithDefaults = {
-        ...res.data,
-        countryCode: res.data.countryCode || "+91",
-        emergencyCountryCode: res.data.emergencyCountryCode || "+91",
-        phone: res.data.phone || "",
-        emergencyPhone: res.data.emergencyPhone || "",
-      };
-      const profileWithCountry = {
-        ...res.data,
-        countryCode: res.data.countryCode || "+91",
-      };
-      setProfileData(profileWithCountry);
-      setEditedProfile(profileWithCountry);
+      const editableProfile = profileForEditing(res.data);
+      setProfileData(editableProfile);
+      setEditedProfile(editableProfile);
     } catch (err) {
       console.error("Error loading profile:", err);
     }
@@ -564,15 +618,17 @@ const Dashboard = () => {
 
     try {
       const token = localStorage.getItem("access_token");
-      await axios.put("/api/profile", editedProfile, {
+      await axios.put("/api/profile", profileForSaving(editedProfile), {
         headers: { Authorization: `Bearer ${token}` },
       });
-      setProfileData(editedProfile);
+      await loadProfile();
 
       // Update user in localStorage
       const storedUser = JSON.parse(localStorage.getItem("user"));
-      storedUser.name = editedProfile.name;
-      localStorage.setItem("user", JSON.stringify(storedUser));
+      if (storedUser) {
+        storedUser.name = editedProfile.name;
+        localStorage.setItem("user", JSON.stringify(storedUser));
+      }
 
       setShowProfileModal(false);
       alert("Profile updated successfully!");
@@ -581,24 +637,56 @@ const Dashboard = () => {
       alert("Error updating profile");
     }
   };
+
+  const updateMealProfileField = (field, value) => {
+    setEditedProfile((current) => ({
+      ...current,
+      meal_planning: {
+        ...defaultMealPlanningProfile,
+        ...(current.meal_planning || {}),
+        [field]: value,
+      },
+    }));
+  };
+
   const handleDeleteAccount = async () => {
     const confirmed = window.confirm(
-      "⚠️ WARNING: This will permanently delete your account and all associated data. This action cannot be undone. Do you want to delete your account?",
+      "This disables sign-in immediately and starts an audited deletion request. Some clinical, SOS, security, or audit records may be retained when legally required. Continue?",
     );
 
     if (!confirmed) return;
+    const password = window.prompt(
+      "Re-enter your current password to continue:",
+    );
+    if (!password) return;
+    const typedConfirmation = window.prompt("Type DELETE to confirm:");
+    if (typedConfirmation !== "DELETE") {
+      alert(
+        "Account deletion request cancelled. The confirmation did not match DELETE.",
+      );
+      return;
+    }
 
     try {
-      await axios.delete("/api/auth/delete-account", {
-        headers: {
-          Authorization: `Bearer ${localStorage.getItem("access_token")}`,
+      const response = await axios.post(
+        "/api/auth/account-deletion-request",
+        {
+          password,
+          confirmation: typedConfirmation,
         },
-      });
+        {
+          headers: {
+            Authorization: `Bearer ${localStorage.getItem("access_token")}`,
+          },
+        },
+      );
 
       localStorage.removeItem("access_token"); // remove token
       logout(); // your logout function
       navigate("/"); // redirect to home/login
-      alert("✅ Account deleted successfully");
+      alert(
+        `Account deletion request accepted. ${response.data.retention_notice}`,
+      );
     } catch (err) {
       console.error("Delete account failed:", err);
       alert(
@@ -1435,10 +1523,10 @@ const Dashboard = () => {
   );
 
   return (
-    <div className="dashboard-responsive min-h-screen bg-gradient-to-b from-blue-50 to-white">
+    <div className="min-h-screen bg-gradient-to-b from-blue-50 to-white">
       {/* Header */}
       <header className="bg-white/80 backdrop-blur-sm shadow-sm sticky top-0 z-50">
-        <div className="max-w-7xl mx-auto px-4 py-4 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+        <div className="max-w-7xl mx-auto px-4 py-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 bg-blue-600 rounded-lg flex items-center justify-center">
               <i className="fas fa-heartbeat text-white text-xl"></i>
@@ -1549,7 +1637,11 @@ const Dashboard = () => {
               exit={{ scale: 0.9, opacity: 0 }}
               onClick={(e) => e.stopPropagation()}
               className={`bg-white rounded-2xl shadow-2xl w-full max-h-[90vh] overflow-y-auto ${
-                user?.role === "clinician" ? "max-w-5xl" : "max-w-2xl"
+                user?.role === "clinician"
+                  ? "max-w-5xl"
+                  : user?.role === "patient"
+                    ? "max-w-4xl"
+                    : "max-w-2xl"
               }`}
             >
               {/* Modal Header */}
@@ -1565,7 +1657,9 @@ const Dashboard = () => {
                       <h2 className="text-2xl font-bold">
                         {user?.role === "clinician"
                           ? "Clinician Profile"
-                          : "User Profile"}
+                          : user?.role === "patient"
+                            ? "CareConnect Profile"
+                            : "User Profile"}
                       </h2>
                       <p className="text-sm opacity-90 capitalize">
                         {user?.role} Account
@@ -1698,7 +1792,7 @@ const Dashboard = () => {
                       Medical Information
                     </h3>
 
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div className="grid grid-cols-2 gap-4">
                       <div>
                         <label className="block text-sm font-medium text-gray-700 mb-1">
                           Age
@@ -1833,6 +1927,304 @@ const Dashboard = () => {
                             country
                           </p>
                         )}
+                    </div>
+
+                    <div className="space-y-4 border-t border-gray-200 pt-5">
+                      <div>
+                        <h3 className="text-lg font-semibold text-gray-800">
+                          Health &amp; Meal Planning
+                        </h3>
+                        <p className="mt-1 text-sm text-gray-500">
+                          These details are shared across CareConnect, including
+                          the Meal Planner.
+                        </p>
+                      </div>
+
+                      <div className="grid gap-4 sm:grid-cols-3">
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">
+                            Gender
+                          </label>
+                          <select
+                            value={editedProfile.gender || ""}
+                            onChange={(e) =>
+                              setEditedProfile({
+                                ...editedProfile,
+                                gender: e.target.value,
+                              })
+                            }
+                            className="w-full rounded-lg border border-gray-300 px-4 py-2 focus:ring-2 focus:ring-blue-500"
+                          >
+                            <option value="">Select gender</option>
+                            <option value="male">Male</option>
+                            <option value="female">Female</option>
+                            <option value="other">
+                              Other / Prefer not to say
+                            </option>
+                          </select>
+                        </div>
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">
+                            Weight
+                          </label>
+                          <div className="relative">
+                            <input
+                              type="number"
+                              min="20"
+                              max="500"
+                              step="0.1"
+                              value={editedProfile.weight_kg ?? ""}
+                              onChange={(e) =>
+                                setEditedProfile({
+                                  ...editedProfile,
+                                  weight_kg: e.target.value,
+                                })
+                              }
+                              className="w-full rounded-lg border border-gray-300 px-4 py-2 pr-12 focus:ring-2 focus:ring-blue-500"
+                            />
+                            <span className="absolute right-4 top-2.5 text-sm text-gray-500">
+                              kg
+                            </span>
+                          </div>
+                        </div>
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">
+                            Height
+                          </label>
+                          <div className="relative">
+                            <input
+                              type="number"
+                              min="100"
+                              max="250"
+                              step="0.1"
+                              value={editedProfile.height_cm ?? ""}
+                              onChange={(e) =>
+                                setEditedProfile({
+                                  ...editedProfile,
+                                  height_cm: e.target.value,
+                                })
+                              }
+                              className="w-full rounded-lg border border-gray-300 px-4 py-2 pr-12 focus:ring-2 focus:ring-blue-500"
+                            />
+                            <span className="absolute right-4 top-2.5 text-sm text-gray-500">
+                              cm
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="grid gap-4 sm:grid-cols-2">
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">
+                            Health goal
+                          </label>
+                          <select
+                            value={
+                              editedProfile.meal_planning?.purpose ||
+                              "Improve Health"
+                            }
+                            onChange={(e) =>
+                              updateMealProfileField("purpose", e.target.value)
+                            }
+                            className="w-full rounded-lg border border-gray-300 px-4 py-2 focus:ring-2 focus:ring-blue-500"
+                          >
+                            {[
+                              "Weight Loss",
+                              "Weight Gain",
+                              "Maintain Weight",
+                              "Build Muscle",
+                              "Improve Health",
+                              "Save Time",
+                              "Learn to Cook",
+                              "Family Meal Planning",
+                            ].map((option) => (
+                              <option key={option}>{option}</option>
+                            ))}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">
+                            Activity level
+                          </label>
+                          <select
+                            value={
+                              editedProfile.meal_planning?.activity_level ||
+                              "moderate"
+                            }
+                            onChange={(e) =>
+                              updateMealProfileField(
+                                "activity_level",
+                                e.target.value,
+                              )
+                            }
+                            className="w-full rounded-lg border border-gray-300 px-4 py-2 focus:ring-2 focus:ring-blue-500"
+                          >
+                            <option value="sedentary">Sedentary</option>
+                            <option value="light">Light</option>
+                            <option value="moderate">Moderate</option>
+                            <option value="active">Active</option>
+                            <option value="very-active">Very active</option>
+                          </select>
+                        </div>
+                      </div>
+
+                      <div className="grid gap-4 sm:grid-cols-2">
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">
+                            Dietary preference
+                          </label>
+                          <select
+                            value={
+                              editedProfile.meal_planning
+                                ?.dietary_preferences?.[0] || "Any"
+                            }
+                            onChange={(e) =>
+                              updateMealProfileField(
+                                "dietary_preferences",
+                                e.target.value === "Any"
+                                  ? []
+                                  : [e.target.value],
+                              )
+                            }
+                            className="w-full rounded-lg border border-gray-300 px-4 py-2 focus:ring-2 focus:ring-blue-500"
+                          >
+                            {[
+                              "Any",
+                              "Vegetarian",
+                              "Vegan",
+                              "Gluten-Free",
+                              "Dairy-Free",
+                              "Keto",
+                              "Paleo",
+                              "Mediterranean",
+                            ].map((option) => (
+                              <option key={option}>{option}</option>
+                            ))}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">
+                            Default cuisine
+                          </label>
+                          <input
+                            type="text"
+                            maxLength="100"
+                            value={
+                              editedProfile.meal_planning?.default_cuisine ||
+                              "Any"
+                            }
+                            onChange={(e) =>
+                              updateMealProfileField(
+                                "default_cuisine",
+                                e.target.value,
+                              )
+                            }
+                            placeholder="Any"
+                            className="w-full rounded-lg border border-gray-300 px-4 py-2 focus:ring-2 focus:ring-blue-500"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="grid gap-4 sm:grid-cols-3">
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">
+                            Cooking time
+                          </label>
+                          <select
+                            value={
+                              editedProfile.meal_planning
+                                ?.available_time_minutes || 30
+                            }
+                            onChange={(e) =>
+                              updateMealProfileField(
+                                "available_time_minutes",
+                                Number(e.target.value),
+                              )
+                            }
+                            className="w-full rounded-lg border border-gray-300 px-4 py-2 focus:ring-2 focus:ring-blue-500"
+                          >
+                            {[15, 30, 45, 60].map((minutes) => (
+                              <option key={minutes} value={minutes}>
+                                {minutes} minutes
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">
+                            Budget
+                          </label>
+                          <select
+                            value={
+                              editedProfile.meal_planning?.budget_level ||
+                              "moderate"
+                            }
+                            onChange={(e) =>
+                              updateMealProfileField(
+                                "budget_level",
+                                e.target.value,
+                              )
+                            }
+                            className="w-full rounded-lg border border-gray-300 px-4 py-2 focus:ring-2 focus:ring-blue-500"
+                          >
+                            <option value="low">Low</option>
+                            <option value="moderate">Moderate</option>
+                            <option value="flexible">Flexible</option>
+                          </select>
+                        </div>
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">
+                            Default servings
+                          </label>
+                          <input
+                            type="number"
+                            min="1"
+                            max="12"
+                            value={editedProfile.meal_planning?.servings || 1}
+                            onChange={(e) =>
+                              updateMealProfileField(
+                                "servings",
+                                Number(e.target.value),
+                              )
+                            }
+                            className="w-full rounded-lg border border-gray-300 px-4 py-2 focus:ring-2 focus:ring-blue-500"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="grid gap-4 sm:grid-cols-3">
+                        {[
+                          [
+                            "allergies_text",
+                            "Food allergies",
+                            "peanuts, shellfish",
+                          ],
+                          ["intolerances_text", "Intolerances", "lactose"],
+                          [
+                            "disliked_ingredients_text",
+                            "Disliked ingredients",
+                            "mushrooms",
+                          ],
+                        ].map(([field, label, placeholder]) => (
+                          <div key={field}>
+                            <label className="block text-sm font-medium text-gray-700 mb-1">
+                              {label}
+                            </label>
+                            <textarea
+                              rows="2"
+                              value={editedProfile.meal_planning?.[field] || ""}
+                              onChange={(e) =>
+                                updateMealProfileField(field, e.target.value)
+                              }
+                              placeholder={placeholder}
+                              className="w-full rounded-lg border border-gray-300 px-4 py-2 focus:ring-2 focus:ring-blue-500"
+                            />
+                            <p className="mt-1 text-xs text-gray-500">
+                              Separate items with commas.
+                            </p>
+                          </div>
+                        ))}
+                      </div>
                     </div>
                   </div>
                 )}
@@ -2915,7 +3307,7 @@ const Dashboard = () => {
 
                   {/* Professional Details Form */}
                   <div className="space-y-4">
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div className="grid grid-cols-2 gap-4">
                       <div>
                         <label className="block text-sm font-medium text-gray-700 mb-2">
                           Specialization *
@@ -4724,7 +5116,7 @@ const Dashboard = () => {
                         </span>
                       </div>
 
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
+                      <div className="grid grid-cols-2 gap-3 mb-3">
                         <div className="bg-blue-50 p-3 rounded">
                           <p className="text-xs text-gray-600">
                             Specialization
@@ -6041,19 +6433,13 @@ const Dashboard = () => {
 
         {currentView === "clinical-search" &&
           ["admin", "clinician"].includes(user?.role) && (
-            <div className="space-y-8">
-              <ClinicalSearch
-                user={user}
-                onOpenPatient={(patient) => {
-                  setClinicalProfileTarget(patient);
-                }}
-                onOpenRecord={(recordId) => loadRecordDetails(recordId)}
-              />
-
-              {/* {user?.role === "clinician" && (
-                <DoctorCrossConsultSearch user={user} />
-              )} */}
-            </div>
+            <ClinicalSearch
+              user={user}
+              onOpenPatient={(patient) => {
+                setClinicalProfileTarget(patient);
+              }}
+              onOpenRecord={(recordId) => loadRecordDetails(recordId)}
+            />
           )}
 
         {currentView === "security" && <SecuritySessions />}
@@ -6126,6 +6512,8 @@ const Dashboard = () => {
             </div>
 
             <AIReportComparison records={records} />
+
+            {user?.role === "patient" && <PatientCrossConsultationStatus />}
 
             {records.length === 0 ? (
               <div className="text-center py-12 bg-blue-50 rounded-lg border-2 border-dashed border-blue-200">

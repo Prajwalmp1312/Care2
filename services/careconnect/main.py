@@ -1,10 +1,11 @@
-from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Form, Request, Query
+from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Form, Request, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel, EmailStr
 from typing import Optional, Dict, Any, List, Set
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from contextlib import asynccontextmanager
 import asyncio
 import bcrypt
 from jose import JWTError, jwt
@@ -14,8 +15,6 @@ from google.oauth2 import id_token
 from google.auth.transport import requests
 import secrets
 import hashlib
-import csv
-import io
 from urllib.parse import urlparse, urlunparse
 # from email_service import send_reset_email, send_verification_code
 
@@ -30,22 +29,27 @@ import re
 from sqlalchemy import or_, text
 import fitz  # PyMuPDF for reading PDF text
 from models import MessageRequest as MessageRequestModel
-from database import SessionLocal
+from database import SessionLocal, engine
 from database import get_db, init_db, get_user_by_email_and_role, email_exists
-from models import Patient as PatientModel, Clinician as ClinicianModel, Admin as AdminModel, Appointment as AppointmentModel, AppointmentReminder as AppointmentReminderModel, Prescription as PrescriptionModel, Notification as NotificationModel, MedicalRecordVersion as RecordVersionModel, PatientProfileHistory as PatientProfileHistoryModel, EmergencyAlert as EmergencyAlertModel, EmergencyAlertEvent as EmergencyAlertEventModel, UserConsent as UserConsentModel, VideoConsultationEvent as VideoConsultationEventModel, UserSession as UserSessionModel, SecurityAuditEvent as SecurityAuditEventModel
+from models import Patient as PatientModel, Clinician as ClinicianModel, Admin as AdminModel, Appointment as AppointmentModel, AppointmentReminder as AppointmentReminderModel, Prescription as PrescriptionModel, Notification as NotificationModel, MedicalRecordVersion as RecordVersionModel, PatientProfileHistory as PatientProfileHistoryModel, EmergencyAlert as EmergencyAlertModel, EmergencyAlertEvent as EmergencyAlertEventModel, UserConsent as UserConsentModel, VideoConsultationEvent as VideoConsultationEventModel, UserSession as UserSessionModel, AccountDeletionRequest as AccountDeletionRequestModel, SecurityAuditEvent as SecurityAuditEventModel
 from models import Message as MessageModel, MedicalRecord as RecordModel, CrossConsultation as CrossConsultationModel
 import mimetypes
 from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
 from models import ChatAttachment as ChatAttachmentModel
 from PIL import Image
 import pytesseract
 from medical_analysis import MedicalRecordAnalyzer, generate_health_summary
 import json
 import logging
+from email_service import send_reset_email
 from rag_service import index_record, retrieve_relevant_chunks, delete_record_chunks
 from nutrition_integration import build_nutrition_router
-from meal_planner import build_meal_planner_router, init_meal_planner_schema
+from meal_planner import (
+    build_meal_planner_router,
+    get_meal_profile_settings,
+    init_meal_planner_schema,
+    update_meal_profile_settings,
+)
 from clinical_organization import (
     CATEGORY_BY_CODE,
     RECORD_CATEGORIES,
@@ -56,21 +60,47 @@ from clinical_organization import (
 from security_foundation import (
     CHAT_UPLOAD_EXTENSIONS,
     MEDICAL_UPLOAD_EXTENSIONS,
-    InMemoryRateLimiter,
     RateLimitRule,
+    build_rate_limiter,
     configured_upload_root,
     read_validated_upload,
     store_upload,
 )
+from clinical_export import (
+    build_clinical_summary_docx,
+    build_clinical_summary_pdf,
+    build_report_comparison_docx,
+    build_report_comparison_pdf,
+)
+from report_comparison import compare_metrics
+from ai_resilience import call_with_transient_retry
 
 try:
-    import google.generativeai as genai
+    from google import genai
 except (ImportError, TypeError) as exc:
-    # Gemini is optional. Some dependency combinations (notably protobuf on
-    # unsupported Python versions) can fail while the module is being imported.
-    # Keep the API available and let the existing rule-based responses handle it.
+    # Gemini is optional. Keep the API available and let the existing
+    # rule-based responses handle missing or incompatible SDK installations.
     genai = None
-    logging.getLogger(__name__).warning("Gemini support is unavailable: %s", exc)
+    logging.getLogger(__name__).warning(
+        "Google Gen AI SDK is unavailable: %s", exc
+    )
+
+
+class GeminiModelAdapter:
+    """Preserve the application's generate_content interface on google-genai."""
+
+    def __init__(self, client: Any, model_name: str):
+        self._client = client
+        self._model_name = model_name
+
+    def generate_content(self, contents: Any):
+        return call_with_transient_retry(
+            lambda: self._client.models.generate_content(
+                model=self._model_name,
+                contents=contents,
+            ),
+            provider_name="Gemini",
+        )
 
 def validate_password(password: str):
     if len(password) < 8:
@@ -118,6 +148,9 @@ JWT_ISSUER = os.getenv("JWT_ISSUER", "careconnect-api")
 JWT_AUDIENCE = os.getenv("JWT_AUDIENCE", "careconnect-web")
 REQUIRE_EMAIL_VERIFICATION = os.getenv("REQUIRE_EMAIL_VERIFICATION", "false").lower() == "true"
 TRUST_PROXY_HEADERS = os.getenv("TRUST_PROXY_HEADERS", "false").lower() == "true"
+API_RATE_LIMIT_PER_MINUTE = int(os.getenv("API_RATE_LIMIT_PER_MINUTE", "600"))
+RUN_BACKGROUND_SCHEDULERS = os.getenv("RUN_BACKGROUND_SCHEDULERS", "true").lower() == "true"
+ENABLE_API_DOCS = os.getenv("ENABLE_API_DOCS", "true" if ENVIRONMENT != "production" else "false").lower() == "true"
 MEDICAL_UPLOAD_MAX_BYTES = int(os.getenv("MEDICAL_UPLOAD_MAX_MB", "20")) * 1024 * 1024
 CHAT_UPLOAD_MAX_BYTES = int(os.getenv("CHAT_UPLOAD_MAX_MB", "10")) * 1024 * 1024
 UPLOAD_STORAGE_ROOT = configured_upload_root(__file__)
@@ -168,6 +201,26 @@ def _configured_comm360_url() -> str:
 
 COMM360_BASE_URL = _configured_comm360_url()
 CONSENT_DEFINITIONS = {
+    "privacy_terms": {
+        "version": "2026-08",
+        "title": "Care 360 privacy and terms acknowledgement",
+        "disclosures": [
+            "Care 360 stores account, care, messaging, and uploaded health information to provide the service.",
+            "Authorized care-team members may access information according to your connections and their assigned role.",
+            "You can review consent, active sessions, and request account deletion from the application.",
+            "The published Privacy Policy and Terms of Use govern retention, processors, support, and your legal rights.",
+        ],
+    },
+    "ai_health_guidance": {
+        "version": "2026-08",
+        "title": "AI-assisted guidance acknowledgement",
+        "disclosures": [
+            "AI summaries, health chat, clinical search, and meal suggestions can be incomplete or incorrect.",
+            "AI output is educational decision support and is not a diagnosis, prescription, or substitute for a licensed professional.",
+            "Do not use Care 360 or its AI features for emergencies; contact local emergency services for immediate danger.",
+            "Clinicians remain responsible for reviewing source records and applying independent clinical judgment.",
+        ],
+    },
     "video_consultation": {
         "version": "2026-07",
         "title": "Video consultation consent",
@@ -198,9 +251,26 @@ if SECRET_KEY == "your-super-secret-key-change-this":
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/auth/login")
 USE_GEMINI_HEALTH_TIPS = os.getenv("USE_GEMINI_HEALTH_TIPS", "false").lower() == "true"
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await startup_event()
+    try:
+        yield
+    finally:
+        await shutdown_event()
+
+
 # Initialize FastAPI app
-app = FastAPI(title="CareConnect Pro API")
-rate_limiter = InMemoryRateLimiter()
+app = FastAPI(
+    title="Care 360 API",
+    lifespan=lifespan,
+    docs_url="/docs" if ENABLE_API_DOCS else None,
+    redoc_url="/redoc" if ENABLE_API_DOCS else None,
+    openapi_url="/openapi.json" if ENABLE_API_DOCS else None,
+)
+rate_limiter = build_rate_limiter(environment=ENVIRONMENT)
 
 RATE_LIMIT_RULES = {
     ("POST", "/api/auth/login"): RateLimitRule(10, 60),
@@ -221,7 +291,6 @@ AUDITED_READ_PREFIXES = (
     "/api/chat/download",
     "/api/exports",
 )
-
 
 def _request_ip(request: Request) -> str:
     if TRUST_PROXY_HEADERS:
@@ -252,20 +321,39 @@ def _audit_actor_from_request(request: Request) -> tuple[Optional[str], Optional
 async def security_foundation_middleware(request: Request, call_next):
     """Rate-limit sensitive routes, attach hardening headers, and audit access."""
 
-    request_id = request.headers.get("x-request-id") or secrets.token_hex(16)
+    supplied_request_id = request.headers.get("x-request-id", "")
+    request_id = (
+        supplied_request_id
+        if re.fullmatch(r"[A-Za-z0-9._-]{1,64}", supplied_request_id)
+        else secrets.token_hex(16)
+    )
     request.state.request_id = request_id
     client_ip = _request_ip(request)
     specific_rule = RATE_LIMIT_RULES.get((request.method.upper(), request.url.path))
     rule = specific_rule
-    if not rule and request.url.path.startswith("/api/"):
-        rule = RateLimitRule(240, 60)
+    health_paths = {"/api/health", "/api/health/live", "/api/health/ready"}
+    if not rule and request.url.path.startswith("/api/") and request.url.path not in health_paths:
+        rule = RateLimitRule(API_RATE_LIMIT_PER_MINUTE, 60)
 
     if rule:
         rate_scope = request.url.path if specific_rule else "api-global"
-        allowed, retry_after = rate_limiter.check(
-            f"{client_ip}:{request.method.upper()}:{rate_scope}",
-            rule,
-        )
+        actor_email, _ = _audit_actor_from_request(request)
+        rate_identity = f"user:{actor_email.lower()}" if actor_email else f"ip:{client_ip}"
+        limiter_key = f"{rate_identity}:{request.method.upper()}:{rate_scope}"
+        try:
+            if getattr(rate_limiter, "blocking_io", False):
+                allowed, retry_after = await asyncio.to_thread(
+                    rate_limiter.check, limiter_key, rule
+                )
+            else:
+                allowed, retry_after = rate_limiter.check(limiter_key, rule)
+        except Exception:
+            logging.getLogger(__name__).exception("Shared rate limiter is unavailable")
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "Traffic controls are temporarily unavailable."},
+                headers={"Retry-After": "1", "X-Request-ID": request_id},
+            )
         if not allowed:
             return JSONResponse(
                 status_code=429,
@@ -337,30 +425,54 @@ async def security_foundation_middleware(request: Request, call_next):
 medical_analyzer = MedicalRecordAnalyzer()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL", "").strip()
 
-if GEMINI_API_KEY and genai is not None:
-    genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel('gemini-2.5-flash')
+if GEMINI_API_KEY and GEMINI_MODEL_NAME and genai is not None:
+    try:
+        gemini_model = GeminiModelAdapter(
+            genai.Client(api_key=GEMINI_API_KEY),
+            GEMINI_MODEL_NAME,
+        )
+    except Exception as exc:
+        gemini_model = None
+        logging.getLogger(__name__).warning(
+            "Gemini client initialization failed; using fallback responses: %s",
+            exc,
+        )
 else:
     gemini_model = None
     if not GEMINI_API_KEY:
         logging.getLogger(__name__).warning(
             "GEMINI_API_KEY not found. Chatbot will use fallback responses."
         )
+    elif not GEMINI_MODEL_NAME:
+        logging.getLogger(__name__).warning(
+            "GEMINI_MODEL not found. Chatbot will use fallback responses."
+        )
 
 # Add CORS middleware BEFORE registering startup events / routes
-allowed_origins = {
-    FRONTEND_URL,
-    "http://localhost:3000",
-    "http://localhost:5173",
-    "http://127.0.0.1:3000",
-    "http://127.0.0.1:5173",
-}
+allowed_origins = {FRONTEND_URL}
+if ENVIRONMENT != "production":
+    allowed_origins.update({
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:5173",
+    })
 allowed_origins.update(
     origin.strip()
     for origin in os.getenv("ALLOWED_ORIGINS", "").split(",")
     if origin.strip()
 )
+if ENVIRONMENT == "production":
+    insecure_origins = sorted(
+        origin for origin in allowed_origins if not origin.startswith("https://")
+    )
+    if insecure_origins:
+        raise RuntimeError(
+            "Production FRONTEND_URL and ALLOWED_ORIGINS must use HTTPS: "
+            + ", ".join(insecure_origins)
+        )
 app.add_middleware(
     CORSMiddleware,
     allow_origins=sorted(allowed_origins),
@@ -409,19 +521,22 @@ async def appointment_reminder_loop():
         await asyncio.sleep(30)
 
 
-@app.on_event("startup")
 async def startup_event():
     global emergency_monitor_task, appointment_reminder_task
     init_db()
     ensure_prescription_multi_medicine_column()
     init_meal_planner_schema()
-    emergency_monitor_task = asyncio.create_task(emergency_monitor_loop())
-    appointment_reminder_task = asyncio.create_task(
-        appointment_reminder_loop()
-    )
+    if RUN_BACKGROUND_SCHEDULERS:
+        emergency_monitor_task = asyncio.create_task(emergency_monitor_loop())
+        appointment_reminder_task = asyncio.create_task(
+            appointment_reminder_loop()
+        )
+    else:
+        logging.getLogger(__name__).info(
+            "Background schedulers are disabled for this API replica"
+        )
 
 
-@app.on_event("shutdown")
 async def shutdown_event():
     global emergency_monitor_task, appointment_reminder_task
     if emergency_monitor_task:
@@ -586,14 +701,15 @@ class CrossConsultationCreate(BaseModel):
     requested_to_clinician_email: EmailStr
     reason: str
     case_summary: Optional[str] = None
-    priority: str = "normal"    
+    priority: str = "normal"
+    attached_record_ids: List[int] = []
+
 
 class CrossConsultationUpdate(BaseModel):
     status: str
     response_notes: Optional[str] = None
     recommendation: Optional[str] = None
-
-
+    specialist_notes: Optional[str] = None
 
 # Helper Functions
 def utc_now_aware() -> datetime:
@@ -788,11 +904,6 @@ def require_patient_access(db: Session, current_user, patient_email: str) -> Non
 
 app.include_router(build_nutrition_router(get_current_user))
 app.include_router(build_meal_planner_router(get_current_user, gemini_model))
-app.mount(
-    "/uploads/meal-planner",
-    StaticFiles(directory=os.path.join(os.path.dirname(__file__), "uploads", "meal-planner")),
-    name="meal-planner-uploads",
-)
 
 def create_notification(
     db: Session,
@@ -885,7 +996,6 @@ async def get_consent_status(
         consent_type=consent_type,
     )
 
-
 @app.post("/api/consents/{consent_type}")
 async def accept_consent(
     consent_type: str,
@@ -962,6 +1072,105 @@ async def revoke_consent(
     db.commit()
     return {"message": "Consent revoked", "consent_type": consent_type}
 
+def _parse_attached_record_ids(value):
+    if not value:
+        return []
+
+    try:
+        parsed = json.loads(value)
+        if isinstance(parsed, list):
+            return [int(item) for item in parsed if str(item).isdigit()]
+    except Exception:
+        pass
+
+    return []
+
+
+def _get_attached_records_for_consultation(db: Session, consultation):
+    record_ids = _parse_attached_record_ids(consultation.attached_record_ids)
+
+    if not record_ids:
+        return []
+
+    records = db.query(RecordModel).filter(
+        RecordModel.id.in_(record_ids),
+        RecordModel.patient_email == consultation.patient_email
+    ).all()
+
+    return [
+        {
+            "id": record.id,
+            "name": record.name,
+            "type": record.type,
+            "category": record.category,
+            "category_code": getattr(record, "category_code", "other") or "other",
+            "uploaded_at": record.uploaded_at.isoformat() if record.uploaded_at else None,
+            "analysis_summary": record.analysis_summary,
+            "key_findings": _safe_json_loads(record.key_findings, []),
+            "metrics": _safe_json_loads(record.metrics_data, {}),
+        }
+        for record in records
+    ]
+
+
+def _cross_consultation_payload(db: Session, item, current_user=None):
+    patient = db.query(PatientModel).filter(
+        PatientModel.email == item.patient_email
+    ).first()
+
+    requested_by = db.query(ClinicianModel).filter(
+        ClinicianModel.email == item.requested_by_clinician_email
+    ).first()
+
+    requested_to = db.query(ClinicianModel).filter(
+        ClinicianModel.email == item.requested_to_clinician_email
+    ).first()
+
+    if current_user and current_user.role == "clinician":
+        direction = (
+            "received"
+            if item.requested_to_clinician_email == current_user.email
+            else "sent"
+        )
+    elif current_user and current_user.role == "patient":
+        direction = "patient"
+    else:
+        direction = "admin"
+
+    attached_records = _get_attached_records_for_consultation(db, item)
+
+    return {
+        "id": item.id,
+        "direction": direction,
+
+        "patient_email": item.patient_email,
+        "patient_name": patient.name if patient else item.patient_email,
+
+        "requested_by_clinician_email": item.requested_by_clinician_email,
+        "requested_by_clinician_name": requested_by.name if requested_by else item.requested_by_clinician_email,
+        "requested_by_specialization": requested_by.specialization if requested_by else None,
+
+        "requested_to_clinician_email": item.requested_to_clinician_email,
+        "requested_to_clinician_name": requested_to.name if requested_to else item.requested_to_clinician_email,
+        "requested_to_specialization": requested_to.specialization if requested_to else None,
+
+        "reason": item.reason,
+        "case_summary": item.case_summary,
+        "attached_record_ids": _parse_attached_record_ids(item.attached_record_ids),
+        "attached_records": attached_records,
+
+        "priority": item.priority,
+        "status": item.status,
+
+        "response_notes": item.response_notes,
+        "recommendation": item.recommendation,
+        "specialist_notes": item.specialist_notes,
+
+        "created_at": item.created_at.isoformat() if item.created_at else None,
+        "updated_at": item.updated_at.isoformat() if item.updated_at else None,
+        "completed_at": item.completed_at.isoformat() if item.completed_at else None,
+    }
+
 @app.get("/api/cross-consultations")
 async def get_cross_consultations(
     current_user=Depends(get_current_user),
@@ -989,53 +1198,16 @@ async def get_cross_consultations(
         else:
             raise HTTPException(status_code=403, detail="Not authorized")
 
-        results = []
-
-        for item in consultations:
-            patient = db.query(PatientModel).filter(
-                PatientModel.email == item.patient_email
-            ).first()
-
-            requested_by = db.query(ClinicianModel).filter(
-                ClinicianModel.email == item.requested_by_clinician_email
-            ).first()
-
-            requested_to = db.query(ClinicianModel).filter(
-                ClinicianModel.email == item.requested_to_clinician_email
-            ).first()
-
-            direction = "received" if item.requested_to_clinician_email == current_user.email else "sent"
-
-            results.append({
-                "id": item.id,
-                "direction": direction,
-
-                "patient_email": item.patient_email,
-                "patient_name": patient.name if patient else item.patient_email,
-
-                "requested_by_clinician_email": item.requested_by_clinician_email,
-                "requested_by_clinician_name": requested_by.name if requested_by else item.requested_by_clinician_email,
-
-                "requested_to_clinician_email": item.requested_to_clinician_email,
-                "requested_to_clinician_name": requested_to.name if requested_to else item.requested_to_clinician_email,
-                "requested_to_specialization": requested_to.specialization if requested_to else None,
-
-                "reason": item.reason,
-                "case_summary": item.case_summary,
-                "priority": item.priority,
-                "status": item.status,
-
-                "response_notes": item.response_notes,
-                "recommendation": item.recommendation,
-
-                "created_at": item.created_at.isoformat() if item.created_at else None,
-                "updated_at": item.updated_at.isoformat() if item.updated_at else None
-            })
+        results = [
+            _cross_consultation_payload(db, item, current_user)
+            for item in consultations
+        ]
 
         return {
             "referrals": results,
             "sent": [item for item in results if item["direction"] == "sent"],
             "received": [item for item in results if item["direction"] == "received"],
+            "patient": [item for item in results if item["direction"] == "patient"],
         }
 
     except HTTPException:
@@ -1067,12 +1239,15 @@ async def update_cross_consultation(
         ).first()
 
         if not consultation:
-            raise HTTPException(status_code=404, detail="Cross consultation request not found")
+            raise HTTPException(
+                status_code=404,
+                detail="Cross consultation request not found"
+            )
 
         if consultation.requested_to_clinician_email != current_user.email:
             raise HTTPException(
                 status_code=403,
-                detail="Only the receiving doctor can update this request"
+                detail="Only the receiving specialist can update this request"
             )
 
         allowed_statuses = ["accepted", "rejected", "completed"]
@@ -1083,12 +1258,41 @@ async def update_cross_consultation(
         consultation.status = data.status
         consultation.response_notes = data.response_notes
         consultation.recommendation = data.recommendation
+        consultation.specialist_notes = data.specialist_notes
+
+        if data.status == "completed":
+            consultation.completed_at = utc_now()
 
         db.commit()
         db.refresh(consultation)
 
+        requested_by = db.query(ClinicianModel).filter(
+            ClinicianModel.email == consultation.requested_by_clinician_email
+        ).first()
+
+        patient = db.query(PatientModel).filter(
+            PatientModel.email == consultation.patient_email
+        ).first()
+
+        create_notification(
+            db=db,
+            user_email=consultation.requested_by_clinician_email,
+            title="Cross Consultation Updated",
+            message=f"Dr. {current_user.name} marked the consultation as {data.status}.",
+            notification_type="cross_consultation"
+        )
+
+        create_notification(
+            db=db,
+            user_email=consultation.patient_email,
+            title="Specialist Consultation Updated",
+            message=f"Your specialist consultation status is now {data.status}.",
+            notification_type="cross_consultation"
+        )
+
         return {
-            "message": f"Cross consultation {data.status} successfully"
+            "message": f"Cross consultation {data.status} successfully",
+            "consultation": _cross_consultation_payload(db, consultation, current_user)
         }
 
     except HTTPException:
@@ -1115,6 +1319,74 @@ def get_connected_clinician_emails_for_patient(db: Session, patient_email: str):
             clinician_emails.append(connection.clinician_email)
 
     return clinician_emails
+
+@app.get("/api/medical-records/{record_id}/download")
+async def download_medical_record(
+    record_id: int,
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    record = db.query(RecordModel).filter(RecordModel.id == record_id).first()
+
+    if not record:
+        raise HTTPException(status_code=404, detail="Medical record not found")
+
+    is_owner = current_user.email == record.patient_email
+    is_admin = current_user.role == "admin"
+    is_allowed_clinician = False
+
+    if current_user.role == "clinician":
+        consults = db.query(CrossConsultationModel).filter(
+            CrossConsultationModel.patient_email == record.patient_email,
+            or_(
+                CrossConsultationModel.requested_by_clinician_email == current_user.email,
+                CrossConsultationModel.requested_to_clinician_email == current_user.email,
+            ),
+        ).all()
+
+        for consult in consults:
+            attached_ids = _parse_attached_record_ids(consult.attached_record_ids)
+            if record.id in attached_ids:
+                is_allowed_clinician = True
+                break
+
+    if not is_owner and not is_admin and not is_allowed_clinician:
+        raise HTTPException(
+            status_code=403,
+            detail="You are not allowed to download this file"
+        )
+
+    file_path = record.file_path
+
+    if not file_path:
+        raise HTTPException(
+            status_code=404,
+            detail="This medical record does not have a saved file path"
+        )
+
+    # Fix relative path issue
+    if not os.path.isabs(file_path):
+        file_path = os.path.join(os.path.dirname(__file__), file_path)
+
+    file_path = os.path.abspath(file_path)
+
+    print("Download record id:", record.id)
+    print("Download file path:", file_path)
+    print("File exists:", os.path.exists(file_path))
+
+    if not os.path.exists(file_path):
+        raise HTTPException(
+            status_code=404,
+            detail=f"File not found on server: {file_path}"
+        )
+
+    media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+    return FileResponse(
+        path=file_path,
+        filename=filename,
+        media_type=media_type
+    )
 
 @app.get("/api/referral/clinicians")
 async def search_referral_clinicians(
@@ -1233,57 +1505,153 @@ async def get_referral_my_patients(
         ]
     }
 
-@app.post("/api/cross-consultations")
-async def create_cross_consultation(
-    data: CrossConsultationCreate,
+@app.get("/api/referral/patient-records")
+async def get_referral_patient_records(
+    patient_email: EmailStr,
     current_user=Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     if current_user.role != "clinician":
         raise HTTPException(
             status_code=403,
-            detail="Only clinicians can create cross consultation referrals"
+            detail="Only clinicians can access referral patient records"
         )
 
-    patient = db.query(PatientModel).filter(
-        PatientModel.email == data.patient_email
+    connection = db.query(MessageRequestModel).filter(
+        MessageRequestModel.patient_email == patient_email,
+        MessageRequestModel.clinician_email == current_user.email,
+        MessageRequestModel.status == "accepted"
     ).first()
 
-    if not patient:
-        raise HTTPException(status_code=404, detail="Patient not found")
-
-    target_clinician = db.query(ClinicianModel).filter(
-        ClinicianModel.email == data.requested_to_clinician_email,
-        ClinicianModel.is_active == True
+    appointment = db.query(AppointmentModel).filter(
+        AppointmentModel.patient_email == patient_email,
+        AppointmentModel.clinician_email == current_user.email,
+        AppointmentModel.status.in_(["approved", "completed"])
     ).first()
 
-    if not target_clinician:
-        raise HTTPException(status_code=404, detail="Referral doctor not found")
-
-    if target_clinician.email == current_user.email:
+    if not connection and not appointment:
         raise HTTPException(
-            status_code=400,
-            detail="You cannot refer a patient to yourself"
+            status_code=403,
+            detail="You can attach records only for your connected patients"
         )
 
-    consultation = CrossConsultationModel(
-        patient_email=data.patient_email,
-        requested_by_clinician_email=current_user.email,
-        requested_to_clinician_email=data.requested_to_clinician_email,
-        reason=data.reason,
-        case_summary=data.case_summary,
-        priority=data.priority,
-        status="pending"
-    )
-
-    db.add(consultation)
-    db.commit()
-    db.refresh(consultation)
+    records = db.query(RecordModel).filter(
+        RecordModel.patient_email == patient_email
+    ).order_by(RecordModel.uploaded_at.desc()).all()
 
     return {
-        "message": "Cross consultation referral sent successfully",
-        "consultation_id": consultation.id
+        "records": [
+            {
+                "id": record.id,
+                "name": record.name,
+                "type": record.type,
+                "category": record.category,
+                "category_code": getattr(record, "category_code", "other") or "other",
+                "uploaded_at": record.uploaded_at.isoformat() if record.uploaded_at else None,
+                "analysis_summary": record.analysis_summary,
+                "key_findings": _safe_json_loads(record.key_findings, []),
+            }
+            for record in records
+        ]
     }
+
+@app.post("/api/cross-consultations")
+async def create_cross_consultation(
+    data: CrossConsultationCreate,
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    try:
+        if current_user.role != "clinician":
+            raise HTTPException(
+                status_code=403,
+                detail="Only clinicians can create cross consultation referrals"
+            )
+
+        patient = db.query(PatientModel).filter(
+            PatientModel.email == data.patient_email
+        ).first()
+
+        if not patient:
+            raise HTTPException(status_code=404, detail="Patient not found")
+
+        target_clinician = db.query(ClinicianModel).filter(
+            ClinicianModel.email == data.requested_to_clinician_email,
+            ClinicianModel.is_active == True
+        ).first()
+
+        if not target_clinician:
+            raise HTTPException(status_code=404, detail="Referral doctor not found")
+
+        if target_clinician.email == current_user.email:
+            raise HTTPException(
+                status_code=400,
+                detail="You cannot refer a patient to yourself"
+            )
+
+        # Validate selected records belong to the selected patient
+        attached_record_ids = list(set(data.attached_record_ids or []))
+
+        if attached_record_ids:
+            valid_records_count = db.query(RecordModel).filter(
+                RecordModel.id.in_(attached_record_ids),
+                RecordModel.patient_email == data.patient_email
+            ).count()
+
+            if valid_records_count != len(attached_record_ids):
+                raise HTTPException(
+                    status_code=400,
+                    detail="One or more selected records do not belong to this patient"
+                )
+
+        consultation = CrossConsultationModel(
+            patient_email=data.patient_email,
+            requested_by_clinician_email=current_user.email,
+            requested_to_clinician_email=data.requested_to_clinician_email,
+            reason=data.reason,
+            case_summary=data.case_summary,
+            attached_record_ids=json.dumps(attached_record_ids),
+            priority=data.priority,
+            status="pending"
+        )
+
+        db.add(consultation)
+        db.commit()
+        db.refresh(consultation)
+
+        create_notification(
+            db=db,
+            user_email=data.requested_to_clinician_email,
+            title="New Cross Consultation Request",
+            message=f"Dr. {current_user.name} requested your opinion for patient {patient.name}.",
+            notification_type="cross_consultation"
+        )
+
+        create_notification(
+            db=db,
+            user_email=data.patient_email,
+            title="Cross Consultation Started",
+            message=f"Your doctor requested a specialist opinion from Dr. {target_clinician.name}.",
+            notification_type="cross_consultation"
+        )
+
+        return {
+            "message": "Cross consultation referral sent successfully",
+            "consultation_id": consultation.id,
+            "consultation": _cross_consultation_payload(db, consultation, current_user)
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        print("Cross consultation create error:", str(e))
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Cross consultation create failed: {str(e)}"
+        )
+
 
 def notify_emergency_alert_receivers(db: Session, alert: EmergencyAlertModel):
     # Confirm the SOS in the patient's dashboard notification stream. Patients
@@ -2056,11 +2424,15 @@ def ensure_prescription_multi_medicine_column():
         if not column_exists:
             db.execute(text("ALTER TABLE prescriptions ADD COLUMN medicines_json LONGTEXT NULL"))
             db.commit()
-            print("✅ Added prescriptions.medicines_json column")
+            logging.getLogger(__name__).info(
+                "Added prescriptions.medicines_json column"
+            )
     except Exception as e:
         db.rollback()
         # Keep startup non-blocking so existing single-medicine prescriptions still work.
-        print(f"⚠️ Could not verify/add prescriptions.medicines_json column: {e}")
+        logging.getLogger(__name__).warning(
+            "Could not verify/add prescriptions.medicines_json column: %s", e
+        )
     finally:
         db.close()
 
@@ -2241,7 +2613,6 @@ def build_patient_health_timeline(
 
     if not patient:
         raise HTTPException(status_code=404, detail="Patient not found")
-
     # 1. Medical records uploaded
     records = db.query(RecordModel).filter(
         RecordModel.patient_email == patient_email
@@ -2602,7 +2973,33 @@ async def get_chat_attachments(
 
 @app.get("/api/health")
 def get_health_status():
-    return {'status' : 'alive'}
+    return {"status": "alive", "service": "care360-api"}
+
+
+@app.get("/api/health/live", include_in_schema=False)
+def get_liveness_status():
+    return {"status": "alive"}
+
+
+@app.get("/api/health/ready", include_in_schema=False)
+def get_readiness_status():
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        rate_limiter.healthcheck()
+    except Exception:
+        logging.getLogger(__name__).exception("Readiness dependency check failed")
+        return JSONResponse(
+            status_code=503,
+            content={"status": "not_ready", "dependency": "unavailable"},
+            headers={"Cache-Control": "no-store"},
+        )
+    return {
+        "status": "ready",
+        "database": "available",
+        "rate_limiter": "available",
+        "schedulers_enabled": RUN_BACKGROUND_SCHEDULERS,
+    }
 
 # Download/view attachment
 @app.get("/api/chat/download/{attachment_id}")
@@ -3955,7 +4352,10 @@ async def get_clinician_approval_status(
 
 # ================== USER PROFILE ==================
 @app.get("/api/profile")
-async def get_profile(current_user = Depends(get_current_user)):
+async def get_profile(
+    current_user = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     """Get current user's profile details.
 
     Admin, Patient, and Clinician are stored in different tables, so not every
@@ -3976,6 +4376,9 @@ async def get_profile(current_user = Depends(get_current_user)):
     }
 
     if current_user.role == "patient":
+        meal_planning = get_meal_profile_settings(db, current_user)
+        legacy_weight = meal_planning.pop("weight_kg")
+        legacy_height = meal_planning.pop("height_cm")
         profile_data.update({
             "gender": getattr(current_user, "gender", None),
             "age": getattr(current_user, "age", None),
@@ -3990,7 +4393,14 @@ async def get_profile(current_user = Depends(get_current_user)):
             ),
             "status": getattr(current_user, "status", None),
             **{field: getattr(current_user, field, None) for field in PATIENT_MEASUREMENT_FIELDS},
+            "meal_planning": meal_planning,
         })
+        # Preserve existing Meal Planner measurements while moving users to
+        # the single CareConnect patient profile.
+        if profile_data.get("weight_kg") is None:
+            profile_data["weight_kg"] = legacy_weight
+        if profile_data.get("height_cm") is None:
+            profile_data["height_cm"] = legacy_height
 
     elif current_user.role == "clinician":
         profile_data.update({
@@ -4030,6 +4440,8 @@ async def update_profile(
     
     # Update role-specific fields
     if current_user.role == "patient":
+        if "gender" in profile_data:
+            current_user.gender = str(profile_data["gender"] or "").strip().lower() or None
         if "age" in profile_data:
             raw_age = profile_data["age"]
             if raw_age in (None, ""):
@@ -4055,7 +4467,37 @@ async def update_profile(
         for field in PATIENT_MEASUREMENT_FIELDS:
             if field in profile_data:
                 raw = profile_data[field]
-                setattr(current_user, field, None if raw in (None, "") else float(raw))
+                if raw in (None, ""):
+                    setattr(current_user, field, None)
+                    continue
+                try:
+                    value = float(raw)
+                except (TypeError, ValueError):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"{field.replace('_', ' ').title()} must be numeric",
+                    )
+                ranges = {
+                    "weight_kg": (20, 500),
+                    "height_cm": (100, 250),
+                    "body_fat_percentage": (0, 100),
+                    "muscle_mass_kg": (0, 300),
+                    "waist_cm": (20, 300),
+                    "systolic_bp": (40, 300),
+                    "diastolic_bp": (20, 200),
+                }
+                minimum, maximum = ranges[field]
+                if not minimum <= value <= maximum:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"{field.replace('_', ' ').title()} must be between {minimum} and {maximum}",
+                    )
+                setattr(current_user, field, value)
+        update_meal_profile_settings(
+            db,
+            current_user,
+            profile_data.get("meal_planning") or {},
+        )
     
     elif current_user.role == "clinician":
         if "specialization" in profile_data:
@@ -5547,7 +5989,9 @@ async def create_prescription(
             notification_type="prescription"
         )
     except Exception as e:
-        print(f"⚠️ Prescription created but notification failed: {e}")
+        logging.getLogger(__name__).warning(
+            "Prescription created but notification failed: %s", e
+        )
 
     return {
         "message": "Prescription created successfully",
@@ -7036,9 +7480,21 @@ class ForgotPasswordRequest(BaseModel):
     email: EmailStr
 
 
+def _deliver_reset_email(email: str, reset_link: str) -> None:
+    try:
+        send_reset_email(email, reset_link)
+    except Exception:
+        # The public response intentionally remains non-enumerating. Operations
+        # must alert on this log event because an undelivered reset blocks users.
+        logging.getLogger(__name__).exception(
+            "Password reset email delivery failed for %s", email
+        )
+
+
 @app.post("/api/auth/forgot-password")
 async def forgot_password(
     data: ForgotPasswordRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db)
 ):
     # Always return same message (security)
@@ -7073,11 +7529,7 @@ async def forgot_password(
     # Reset link (frontend)
     reset_link = f"{FRONTEND_URL}/reset-password?token={token}"
 
-    # TEMP: print instead of email
-    # print("🔐 RESET LINK:", reset_link)
-    # send_reset_email(email, reset_link)
-
-
+    background_tasks.add_task(_deliver_reset_email, email, reset_link)
     return response_msg
 class ResetPasswordRequest(BaseModel):
     token: str
@@ -7301,7 +7753,7 @@ async def google_auth(
         google_name = idinfo.get("name") or google_email.split("@")[0]
 
     except Exception as e:
-        print("❌ GOOGLE TOKEN ERROR:", e)
+        logging.getLogger(__name__).warning("Google token validation failed: %s", e)
         raise HTTPException(status_code=401, detail="Invalid Google token")
 
     # ✅ Check if user exists
@@ -7473,44 +7925,104 @@ async def get_messages(db: Session = Depends(get_db), current_user = Depends(get
 class DeleteAccountResponse(BaseModel):
     message: str
 
+
+class AccountDeletionRequestCreate(BaseModel):
+    password: str
+    confirmation: str
+
+
+ACCOUNT_DELETION_RETENTION_NOTICE = (
+    "Your sign-in access is disabled immediately. Care 360 will remove or "
+    "de-identify data that is not subject to a legal, clinical-safety, fraud, "
+    "security, or audit-retention obligation. SOS response history and other "
+    "records that must be retained remain access-restricted for the applicable "
+    "retention period. Contact privacy support to exercise region-specific rights."
+)
+
+
+@app.get("/api/auth/account-deletion-request")
+async def get_account_deletion_request(
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    item = db.query(AccountDeletionRequestModel).filter(
+        AccountDeletionRequestModel.user_email == current_user.email,
+        AccountDeletionRequestModel.user_role == current_user.role,
+    ).order_by(AccountDeletionRequestModel.requested_at.desc()).first()
+    if not item:
+        return {"status": "not_requested"}
+    return {
+        "id": item.id,
+        "status": item.status,
+        "requested_at": item.requested_at.isoformat(),
+        "scheduled_for": item.scheduled_for.isoformat(),
+        "retention_notice": item.retention_notice,
+    }
+
+
+@app.post("/api/auth/account-deletion-request", status_code=202)
+async def request_account_deletion(
+    deletion: AccountDeletionRequestCreate,
+    request: Request,
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if deletion.confirmation.strip().upper() != "DELETE":
+        raise HTTPException(status_code=400, detail="Type DELETE to confirm this request")
+    if not verify_password(deletion.password, current_user.hashed_password):
+        raise HTTPException(status_code=403, detail="Password confirmation failed")
+
+    existing = db.query(AccountDeletionRequestModel).filter(
+        AccountDeletionRequestModel.user_email == current_user.email,
+        AccountDeletionRequestModel.user_role == current_user.role,
+        AccountDeletionRequestModel.status.in_(["pending", "processing"]),
+    ).first()
+    now = utc_now()
+    if not existing:
+        existing = AccountDeletionRequestModel(
+            user_email=current_user.email,
+            user_role=current_user.role,
+            status="pending",
+            requested_at=now,
+            scheduled_for=now + timedelta(days=30),
+            retention_notice=ACCOUNT_DELETION_RETENTION_NOTICE,
+            request_ip=_request_ip(request),
+        )
+        db.add(existing)
+
+    current_user.is_active = False
+    db.query(UserSessionModel).filter(
+        UserSessionModel.user_email == current_user.email,
+        UserSessionModel.user_role == current_user.role,
+        UserSessionModel.revoked_at.is_(None),
+    ).update(
+        {
+            UserSessionModel.revoked_at: now,
+            UserSessionModel.revoke_reason: "account_deletion_requested",
+        },
+        synchronize_session=False,
+    )
+    db.commit()
+    db.refresh(existing)
+    return {
+        "message": "Account deletion request accepted and sign-in access disabled",
+        "request_id": existing.id,
+        "status": existing.status,
+        "scheduled_for": existing.scheduled_for.isoformat(),
+        "retention_notice": existing.retention_notice,
+    }
+
+
 @app.delete("/api/auth/delete-account")
-async def delete_account(current_user=Depends(get_current_user), db: Session = Depends(get_db)):
-    logging.info("DELETE request received for user: %s", current_user.email)
-
-    try:
-        user_model_map = {
-            "patient": PatientModel,
-            "clinician": ClinicianModel,
-            "admin": AdminModel
-        }
-        user_model = user_model_map.get(current_user.role)
-        if not user_model:
-            raise HTTPException(status_code=400, detail="Invalid user role")
-        
-        user = db.query(user_model).filter(user_model.email == current_user.email).first()
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-        
-        # Delete messages
-        db.query(MessageModel).filter(
-    (MessageModel.sender_email == current_user.email) | 
-    (MessageModel.recipient_email == current_user.email)
-).delete(synchronize_session=False)
-
-        
-        # Delete patient records if user is a patient
-        if current_user.role == "patient":
-            db.query(RecordModel).filter(RecordModel.patient_email == current_user.email).delete(synchronize_session=False)
-        
-        # Delete the user
-        db.delete(user)
-        db.commit()
-        
-        return {"message": "Account deleted successfully"}
-
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error deleting account: {str(e)}")
+async def delete_account(current_user=Depends(get_current_user)):
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "Immediate hard deletion has been retired. Re-authenticate and use "
+            "POST /api/auth/account-deletion-request so retention obligations "
+            "and deletion status can be handled safely."
+        ),
+    )
 
 @app.get("/api/records")
 async def get_records(
@@ -7974,6 +8486,10 @@ async def get_patient_clinical_profile(
     patient = db.query(PatientModel).filter(PatientModel.email == patient_email).first()
     if not patient:
         raise HTTPException(status_code=404, detail="Patient not found")
+    meal_profile = db.execute(
+        text("SELECT allergies, intolerances, disliked_ingredients, dietary_preferences FROM meal_planner_profiles WHERE patient_id=:patient_id"),
+        {"patient_id": patient.id},
+    ).mappings().first()
     records = db.query(RecordModel).filter(
         RecordModel.patient_email == patient.email
     ).order_by(RecordModel.uploaded_at.desc()).all()
@@ -7992,8 +8508,17 @@ async def get_patient_clinical_profile(
     for record in records:
         findings.extend(_safe_json_loads(record.key_findings, []))
     summaries = [record.analysis_summary for record in records if record.analysis_summary]
+    cross_consultations = db.query(CrossConsultationModel).filter(
+        CrossConsultationModel.patient_email == patient.email
+    ).order_by(CrossConsultationModel.created_at.desc()).all()
     return {
         "patient": _patient_profile_payload(patient),
+        "meal_preferences": {
+            "allergies": _safe_json_loads(meal_profile.get("allergies"), []) if meal_profile else [],
+            "intolerances": _safe_json_loads(meal_profile.get("intolerances"), []) if meal_profile else [],
+            "disliked_ingredients": _safe_json_loads(meal_profile.get("disliked_ingredients"), []) if meal_profile else [],
+            "dietary_preferences": _safe_json_loads(meal_profile.get("dietary_preferences"), []) if meal_profile else [],
+        },
         "summary": {
             "overview": summaries[0][:1000] if summaries else "No analyzed medical records are available yet.",
             "record_count": len(records),
@@ -8024,6 +8549,10 @@ async def get_patient_clinical_profile(
                 "reason": item.reason, "status": item.status, "notes": item.notes,
             }
             for item in appointments
+        ],
+         "cross_consultations": [
+            _cross_consultation_payload(db, consultation, current_user)
+            for consultation in cross_consultations
         ],
     }
 
@@ -8172,7 +8701,7 @@ async def get_patient_appointment_summary(
 @app.get("/api/exports/patients/{patient_email}/summary")
 async def export_patient_clinical_summary(
     patient_email: str,
-    export_format: str = Query("csv", pattern="^(csv|json)$"),
+    export_format: str = Query("pdf", pattern="^(pdf|docx)$"),
     current_user=Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -8262,82 +8791,35 @@ async def export_patient_clinical_summary(
     }
 
     safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", patient_email).strip("_")
-    if export_format == "json":
-        return Response(
-            content=json.dumps(payload, ensure_ascii=False, indent=2),
-            media_type="application/json",
-            headers={
-                "Content-Disposition": (
-                    f'attachment; filename="{safe_name}_clinical_summary.json"'
-                )
-            },
+    try:
+        if export_format == "pdf":
+            content = build_clinical_summary_pdf(payload)
+            media_type = "application/pdf"
+            extension = "pdf"
+        else:
+            content = build_clinical_summary_docx(payload)
+            media_type = (
+                "application/vnd.openxmlformats-officedocument."
+                "wordprocessingml.document"
+            )
+            extension = "docx"
+    except ImportError as exc:
+        logging.getLogger(__name__).exception(
+            "Clinical document export dependency is unavailable"
         )
-
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["CareConnect Clinical Summary"])
-    writer.writerow(["Patient", patient.name])
-    writer.writerow(["Email", patient.email])
-    writer.writerow(["Exported at", payload["exported_at"]])
-    writer.writerow([])
-    writer.writerow(["Section", "Date", "Item", "Status", "Details"])
-    for record in payload["records"]:
-        writer.writerow(
-            [
-                "Medical Record",
-                record["source_date"] or record["uploaded_at"] or "",
-                record["name"],
-                record["category"],
-                record["analysis_summary"] or "",
-            ]
-        )
-    for prescription in prescriptions:
-        medicine_names = ", ".join(
-            item.get("medicine_name", "")
-            for item in prescription.get("medicines", [])
-        )
-        writer.writerow(
-            [
-                "Prescription",
-                prescription.get("created_at") or "",
-                medicine_names,
-                prescription.get("status") or "",
-                prescription.get("diagnosis") or "",
-            ]
-        )
-    for appointment in payload["appointments"]:
-        writer.writerow(
-            [
-                "Appointment",
-                f'{appointment["date"]} {appointment["time"]}',
-                appointment["type"],
-                appointment["status"],
-                appointment["reason"],
-            ]
-        )
-    for measurement in payload["measurement_history"]:
-        writer.writerow(
-            [
-                "Measurement",
-                measurement.get("recorded_at") or "",
-                "Body composition and vitals",
-                measurement.get("status") or "",
-                (
-                    f'Weight {measurement.get("weight_kg") or "N/A"} kg; '
-                    f'BMI {measurement.get("bmi") or "N/A"}; '
-                    f'BP {measurement.get("systolic_bp") or "N/A"}/'
-                    f'{measurement.get("diastolic_bp") or "N/A"}'
-                ),
-            ]
-        )
+        raise HTTPException(
+            status_code=503,
+            detail="Document export is temporarily unavailable",
+        ) from exc
 
     return Response(
-        content=output.getvalue(),
-        media_type="text/csv",
+        content=content,
+        media_type=media_type,
         headers={
             "Content-Disposition": (
-                f'attachment; filename="{safe_name}_clinical_summary.csv"'
-            )
+                f'attachment; filename="{safe_name}_clinical_summary.{extension}"'
+            ),
+            "Cache-Control": "no-store",
         },
     )
 
@@ -8602,17 +9084,7 @@ Text:
 
             ai_result = json.loads(response_text)
 
-            gemini_summary = ai_result.get("summary") if isinstance(ai_result, dict) else None
-
-            if gemini_summary and len(str(gemini_summary).strip()) > 20:
-                comparison["ai_summary"] = comparison["summary"]
-                comparison["patient_friendly_explanation"] = comparison["summary"]
-            else:
-                comparison["ai_summary"] = comparison["summary"]
-                comparison["patient_friendly_explanation"] = comparison["summary"]
-
-            if comparison["summary"] and "Key changes:" in comparison["summary"]:
-                comparison["ai_summary"] = comparison["summary"]
+            comparison["ai_summary"] = ai_result.get("summary")
             comparison["improved_items"] = ai_result.get("improved_items", [])
             comparison["worsened_items"] = ai_result.get("worsened_items", [])
             comparison["new_concerns"] = ai_result.get("new_concerns", [])
@@ -8646,17 +9118,54 @@ Text:
             "Do not make treatment changes based only on this comparison."
         ]
 
-    print("FIRST RECORD:", first_record.name)
-    print("FIRST METRICS:", first_record.metrics_data)
-
-    print("SECOND RECORD:", second_record.name)
-    print("SECOND METRICS:", second_record.metrics_data)
-
-    print("METRIC COMPARISON:", comparison.get("metric_comparison"))
-
     return comparison
 
 
+@app.post("/api/records/compare/export")
+async def export_medical_report_comparison(
+    comparison_data: ReportComparisonRequest,
+    export_format: str = Query("pdf", pattern="^(pdf|docx)$"),
+    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Export an authorized report comparison as PDF or Word."""
+    comparison = await compare_medical_reports(
+        comparison_data,
+        current_user,
+        db,
+    )
+    try:
+        if export_format == "pdf":
+            content = build_report_comparison_pdf(comparison)
+            media_type = "application/pdf"
+            extension = "pdf"
+        else:
+            content = build_report_comparison_docx(comparison)
+            media_type = (
+                "application/vnd.openxmlformats-officedocument."
+                "wordprocessingml.document"
+            )
+            extension = "docx"
+    except ImportError as exc:
+        logging.getLogger(__name__).exception(
+            "Report comparison export dependency is unavailable"
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Document export is temporarily unavailable",
+        ) from exc
+
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": (
+                "attachment; filename=\"careconnect_report_comparison."
+                f"{extension}\""
+            ),
+            "Cache-Control": "no-store",
+        },
+    )
 
 # ================== AI HEALTH TIPS ==================
 
@@ -8786,7 +9295,9 @@ Example format:
                     "message": "AI-generated wellness tips for your daily routine"
                 }
         except Exception as e:
-            print(f"⚠️ Gemini health tips failed, using curated pool: {e}")
+            logging.getLogger(__name__).warning(
+                "Gemini health tips failed; using curated pool: %s", e
+            )
 
     # Fallback: select random tips from curated pool
     selected = random.sample(DAILY_HEALTH_TIPS, min(tip_count, len(DAILY_HEALTH_TIPS)))
@@ -9369,7 +9880,7 @@ async def rag_reindex_all(
     return {"message": "RAG reindex complete", "result": result}
 
 if __name__ == "__main__":
-    print("🏥 Starting CareConnect Pro Server with MySQL...")
-    print("🗄️  Database: MySQL (careconnect_pro)")
-    print("📊 Tables: patients, clinicians, admins, messages, medical_records")
+    print("Starting Care 360 server with MySQL")
+    print("Database: MySQL (careconnect_pro)")
+    print("Tables: patients, clinicians, admins, messages, medical_records")
     uvicorn.run(app, host="0.0.0.0", port=8000)
